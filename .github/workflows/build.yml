@@ -70,7 +70,7 @@ jobs:
       - name: 查询 flippy 内核精确版本
         run: |
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
-               | grep -oP 'boot-6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -n | tail -1)
+               | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1)
           test -n "$KV" || { echo "查询 flippy 内核版本失败"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
           echo ">>> flippy 内核: 6.12.${KV}"
@@ -79,10 +79,13 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc
           cd ksrc
-          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/boot-${{ env.KV }}.tar.gz" -o /tmp/boot.tar.gz
-          CFG=$(tar tzf /tmp/boot.tar.gz | grep -m1 -i 'config')
-          test -n "$CFG" || { echo "boot 包中没有 config 文件,把日志发我"; exit 1; }
-          tar xzf /tmp/boot.tar.gz -O "$CFG" > .config
+          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/${{ env.KV }}.tar.gz" -o /tmp/k.tar.gz
+          tar xzf /tmp/k.tar.gz -C /tmp
+          BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' | head -1)
+          test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
+          CFG=$(tar tzf "${BOOT_TGZ}" | grep -m1 -i 'config')
+          test -n "$CFG" || { echo "boot 包中没有 config,把日志发我"; exit 1; }
+          tar xzf "${BOOT_TGZ}" -O "$CFG" > .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
           echo "${{ env.KV }}" > include/config/kernel.release
