@@ -149,6 +149,17 @@ jobs:
           echo ">>> 注入包:"
           find inject -type f | sort
 
+      - name: 升级 coreutils(ophub 脚本需要新版 cp 语法)
+        run: |
+          curl -fsSL https://ftp.gnu.org/gnu/coreutils/coreutils-9.9.tar.xz | tar xJ
+          cd coreutils-9.9
+          ./configure --quiet >/dev/null
+          make -j$(nproc) >/dev/null
+          sudo make install >/dev/null
+          hash -r
+          cp --version | head -1
+          cp --update=none --version >/dev/null && echo ">>> cp --update=none 已支持"
+
       - name: 打包 N1 固件(ophub)
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
