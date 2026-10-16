@@ -1,0 +1,143 @@
+name: N1 OpenWrt AX900M 固件编译
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt 版本分支'
+        required: true
+        default: 'v24.10.2'
+      driver_branch:
+        description: 'AX900M 驱动分支 (一般用 main; 若 dmesg 报 chip_mcu_id=1 选 legacy-mcu1)'
+        required: true
+        default: 'main'
+        type: choice
+        options:
+          - main
+          - legacy-mcu1
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            gcc-12-aarch64-linux-gnu bc libelf-dev kmod
+
+      - name: 克隆 OpenWrt 源码
+        run: |
+          git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} \
+            https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成配置(无需仓库内 config 文件)
+        run: |
+          cd openwrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_armsr=y
+          CONFIG_TARGET_armsr_armv8=y
+          CONFIG_TARGET_ROOTFS_TARGZ=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_wpad-mbedtls=y
+          CONFIG_PACKAGE_iw=y
+          CONFIG_PACKAGE_iwinfo=y
+          CONFIG_PACKAGE_bluez-daemon=y
+          CONFIG_PACKAGE_bluez-utils=y
+          CONFIG_PACKAGE_usb-modeswitch=y
+          CONFIG_PACKAGE_usbutils=y
+          EOF
+          sed -i 's/^          //' .config
+          make defconfig
+
+      - name: 下载源码包
+        run: |
+          cd openwrt
+          make download -j$(nproc) || make download -j1 V=s
+
+      - name: 编译 OpenWrt rootfs
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+          ls -lh bin/targets/armsr/armv8/*rootfs.tar.gz
+
+      - name: 查询 flippy 内核精确版本
+        run: |
+          KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
+               | grep -oP 'boot-6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -n | tail -1)
+          test -n "$KV" || { echo "查询 flippy 内核版本失败"; exit 1; }
+          echo "KV=6.12.${KV}" >> $GITHUB_ENV
+          echo ">>> flippy 内核: 6.12.${KV}"
+
+      - name: 准备 flippy 内核构建树
+        run: |
+          git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc
+          cd ksrc
+          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/boot-${{ env.KV }}.tar.gz" -o /tmp/boot.tar.gz
+          CFG=$(tar tzf /tmp/boot.tar.gz | grep -m1 -i 'config')
+          test -n "$CFG" || { echo "boot 包中没有 config 文件,把日志发我"; exit 1; }
+          tar xzf /tmp/boot.tar.gz -O "$CFG" > .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
+          echo "${{ env.KV }}" > include/config/kernel.release
+          sed -i "s/UTS_RELEASE \".*\"/UTS_RELEASE \"${{ env.KV }}\"/" include/generated/utsrelease.h
+          echo ">>> 内核构建树: $(cat include/config/kernel.release)"
+
+      - name: 编译 AX900M 驱动(against flippy 内核)
+        run: |
+          git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
+            https://github.com/shenmintao/aic8800d80.git aicsrc
+          echo ">>> 驱动固件:"
+          ls aicsrc/fw/ 2>/dev/null || find aicsrc -maxdepth 2 -type d -name 'fw*'
+          make -C aicsrc/drivers/aic8800 KDIR=$PWD/ksrc \
+            CROSS_COMPILE=aarch64-linux-gnu- CONFIG_PLATFORM_UBUNTU=y || \
+          make -C ksrc ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            M=$PWD/aicsrc/drivers/aic8800 modules
+          find aicsrc -name '*.ko' | sort
+          echo ">>> vermagic 校验(必须等于 ${{ env.KV }}):"
+          find aicsrc -name '*.ko' -exec modinfo {} \; | grep vermagic
+
+      - name: 组装驱动注入包
+        run: |
+          KV="${{ env.KV }}"
+          mkdir -p inject/lib/modules/${KV} inject/lib/firmware \
+                   inject/etc/usb_modeswitch.d inject/etc/custom_service
+          find aicsrc -name '*.ko' -exec cp {} inject/lib/modules/${KV}/ \;
+          cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
+          find aicsrc -path '*modeswitch*' -type f ! -name '*.md' \
+            -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
+          cat > inject/etc/custom_service/start_service.sh <<'EOF'
+          #!/bin/sh
+          depmod -a $(uname -r) 2>/dev/null
+          modprobe cfg80211 2>/dev/null
+          modprobe aic_load_fw 2>/dev/null && sleep 3
+          modprobe aic8800_fdrv 2>/dev/null
+          modprobe aic_zlp_quirk 2>/dev/null
+          modprobe btusb 2>/dev/null
+          exit 0
+          EOF
+          chmod +x inject/etc/custom_service/start_service.sh
+          echo ">>> 注入包:"
+          find inject -type f | sort
+
+      - name: 打包 N1 固件(ophub)
+        uses: ophub/amlogic-s9xxx-openwrt@main
+        with:
+          openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
+          openwrt_board: s905d
+          openwrt_kernel: ${{ env.KV }}
+          auto_kernel: false
+          openwrt_files: inject
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: N1-OpenWrt-AX900M
+          path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
+          if-no-files-found: error
