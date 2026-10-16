@@ -52,6 +52,9 @@ jobs:
           CONFIG_PACKAGE_bluez-utils=y
           CONFIG_PACKAGE_usb-modeswitch=y
           CONFIG_PACKAGE_usbutils=y
+          CONFIG_PACKAGE_mwan3=y
+          CONFIG_PACKAGE_luci-app-mwan3=y
+          CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
           EOF
           sed -i 's/^          //' .config
           make defconfig
@@ -125,6 +128,42 @@ jobs:
           find aicsrc -name '*.ko' | sort
           echo ">>> vermagic 校验(必须等于 ${{ env.KV }}):"
           find aicsrc -name '*.ko' -exec modinfo {} \; | grep vermagic
+
+      - name: 准备中文语言包与模式切换工具(离线注入)
+        run: |
+          mkdir -p inject/opt/ipks inject/etc/uci-defaults
+          REL="${{ github.event.inputs.openwrt_version }}"
+          REL="${REL#v}"
+          REPO="https://downloads.openwrt.org/releases/${REL}/packages/aarch64_generic"
+          # 下载 ipk 到固件,首次开机离线安装(不依赖 CONFIG 内置,不依赖盒子联网)
+          download_ipk() {
+            local sub="$1" pkg="$2"
+            local file
+            file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
+                   | grep "^Filename: .*${pkg}_" | head -1 | awk '{print $2}')
+            case "$file" in
+              */*) ;;
+              *) file="${sub}/${file}" ;;
+            esac
+            if [ -n "$file" ]; then
+              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/$(basename "${file}")" \
+                && echo ">>> 已下载 ${pkg}"
+            else
+              echo ">>> 仓库里没找到 ${pkg}(忽略)"
+            fi
+          }
+          download_ipk luci luci-i18n-base-zh-cn
+          download_ipk luci luci-i18n-firewall-zh-cn
+          download_ipk luci luci-i18n-mwan3-zh-cn
+          download_ipk packages usb-modeswitch
+          # 首次开机:离线装语言包+切换工具,并设置默认中文
+          cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
+          #!/bin/sh
+          opkg install /opt/ipks/luci-i18n-*.ipk /opt/ipks/usb-modeswitch_*.ipk 2>/dev/null
+          uci set luci.main.lang='zh_cn' 2>/dev/null && uci commit luci 2>/dev/null
+          exit 0
+          EOF
+          chmod +x inject/etc/uci-defaults/99-zh-cn
 
       - name: 组装驱动注入包
         run: |
