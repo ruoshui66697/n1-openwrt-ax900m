@@ -69,7 +69,9 @@ jobs:
           cd openwrt
           make -j$(nproc) || make -j1 V=s
           ls -lh bin/targets/armsr/armv8/*rootfs.tar.gz
-
+          echo ">>> rootfs 内容检查(usb_modeswitch/中文/mwan3 是否真编进去了):"
+          tar tzf bin/targets/armsr/armv8/*rootfs.tar.gz | grep -E 'usb_modeswitch|zh-cn|mwan3' | sort
+          
       - name: 查询 flippy 内核精确版本
         run: |
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
