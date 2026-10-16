@@ -128,20 +128,55 @@ jobs:
 
       - name: 组装驱动注入包
         run: |
-          KV="${{ env.KV }}"
-          mkdir -p inject/lib/modules/${KV} inject/lib/firmware \
-                   inject/etc/usb_modeswitch.d inject/etc/custom_service
-          find aicsrc -name '*.ko' -exec cp {} inject/lib/modules/${KV}/ \;
+          mkdir -p inject/opt/aic8800 inject/lib/firmware \
+                   inject/etc/usb_modeswitch.d inject/etc/custom_service \
+                   inject/etc/hotplug.d/usb
+          # 1. 驱动模块放 /opt/aic8800 —— 不能放 /lib/modules,
+          #    ophub 打包替换内核时会清空 /lib/modules,放那里会被删掉
+          find aicsrc -name '*.ko' -exec cp {} inject/opt/aic8800/ \;
+          # 2. 固件: /lib/firmware 一份 + /opt 备份一份(启动时自愈)
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
+          cp -r aicsrc/fw/. inject/opt/aic8800/fw/ 2>/dev/null || true
+          # 3. 1111:1111 假光盘模式的切换规则
           find aicsrc -path '*modeswitch*' -type f ! -name '*.md' \
             -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
+          # 4. 热插拔自动加载: 插入 AX900M 自动加载驱动,无需重启
+          cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
+          #!/bin/sh
+          # AX900M (AIC8800D80) 热插拔自动加载
+          [ "$ACTION" = "add" ] || exit 0
+          case "$PRODUCT" in
+              a69c:8d80*|a69c:8d83*)
+                  insmod /opt/aic8800/aic_load_fw.ko 2>/dev/null ;;
+              a69c:8d81*|368b:8d81*)
+                  modprobe cfg80211 2>/dev/null
+                  insmod /opt/aic8800/aic8800_fdrv.ko 2>/dev/null
+                  insmod /opt/aic8800/aic_zlp_quirk.ko 2>/dev/null
+                  modprobe btusb 2>/dev/null ;;
+          esac
+          exit 0
+          EOF
+          chmod +x inject/etc/hotplug.d/usb/99-aic8800
+          # 5. 开机脚本: 确保完成模式切换(防止开机时热插拔事件没触发切换)
           cat > inject/etc/custom_service/start_service.sh <<'EOF'
           #!/bin/sh
-          depmod -a $(uname -r) 2>/dev/null
+          i=0
+          while [ $i -lt 40 ]; do
+              lsusb | grep -qiE 'a69c|368b' && break
+              if lsusb | grep -q "1111:1111"; then
+                  usb_modeswitch -v 0x1111 -p 0x1111 \
+                    -M 555342438765432100000000000010fd0000000000000000000000000000f3 \
+                    -M 555342438765432100000000000010fd0000000000000000000000000000f2 >/dev/null 2>&1
+              fi
+              sleep 3; i=$((i+3))
+          done
+          sleep 2
+          [ -d /lib/firmware/aic8800D80 ] || cp -r /opt/aic8800/fw/. /lib/firmware/ 2>/dev/null
           modprobe cfg80211 2>/dev/null
-          modprobe aic_load_fw 2>/dev/null && sleep 3
-          modprobe aic8800_fdrv 2>/dev/null
-          modprobe aic_zlp_quirk 2>/dev/null
+          insmod /opt/aic8800/aic_load_fw.ko 2>/dev/null
+          sleep 3
+          insmod /opt/aic8800/aic8800_fdrv.ko 2>/dev/null
+          insmod /opt/aic8800/aic_zlp_quirk.ko 2>/dev/null
           modprobe btusb 2>/dev/null
           exit 0
           EOF
