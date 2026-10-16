@@ -86,6 +86,18 @@ jobs:
           CFG=$(tar tzf "${BOOT_TGZ}" | grep -m1 -i 'config')
           test -n "$CFG" || { echo "boot 包中没有 config,把日志发我"; exit 1; }
           tar xzf "${BOOT_TGZ}" -O "$CFG" > .config
+          mkdir -p /tmp/boot && tar xzf "${BOOT_TGZ}" -C /tmp/boot
+          zimg=$(find /tmp/boot \( -name 'zImage*' -o -name 'vmlinuz*' \) | head -1)
+          test -n "$zimg" || { echo "boot 包中没有 zImage,把日志发我"; exit 1; }
+          scripts/extract-vmlinux "$zimg" > /tmp/vmlinux
+          aarch64-linux-gnu-nm /tmp/vmlinux | awk '$3 ~ /^__ksymtab_/ {
+              s=$3; sub(/^__ksymtab_/,"",s);
+              sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
+              sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
+              if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
+          }' | sort -u > Module.symvers
+          test -s Module.symvers || { echo "Module.symvers 生成失败,把日志发我"; exit 1; }
+          echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
           echo "${{ env.KV }}" > include/config/kernel.release
@@ -97,9 +109,7 @@ jobs:
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
           echo ">>> 驱动固件:"
-          ls aicsrc/fw/ 2>/dev/null || find aicsrc -maxdepth 2 -type d -name 'fw*'
-          make -C aicsrc/drivers/aic8800 KDIR=$PWD/ksrc \
-            CROSS_COMPILE=aarch64-linux-gnu- CONFIG_PLATFORM_UBUNTU=y || \
+          ls aicsrc/fw/
           make -C ksrc ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             M=$PWD/aicsrc/drivers/aic8800 modules
           find aicsrc -name '*.ko' | sort
