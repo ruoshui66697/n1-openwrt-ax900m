@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3-setuptools rsync swig unzip zlib1g-dev file wget \
-            gcc-12-aarch64-linux-gnu bc libelf-dev kmod
+            gcc-aarch64-linux-gnu bc libelf-dev kmod
 
       - name: 克隆 OpenWrt 源码
         run: |
