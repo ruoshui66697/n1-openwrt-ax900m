@@ -222,14 +222,26 @@ jobs:
           # 从 ipk 里取出 usb_modeswitch 二进制备份到 /opt/bin
           # (系统里的 usb_modeswitch 会被重打包清掉,/opt 安全)
           if [ -s inject/opt/ipks/usb-modeswitch.ipk ]; then
-            rm -rf /tmp/msw && mkdir -p /tmp/msw/data
-            tar xf inject/opt/ipks/usb-modeswitch.ipk -C /tmp/msw
-            tar xf /tmp/msw/data.tar.* -C /tmp/msw/data 2>/dev/null
+            rm -rf /tmp/msw && mkdir -p /tmp/msw/outer /tmp/msw/data
+            IPK="$PWD/inject/opt/ipks/usb-modeswitch.ipk"
+            # ipk 外层可能是多种压缩的 tar,逐个尝试
+            tar xf "$IPK" -C /tmp/msw/outer 2>/dev/null \
+              || zstd -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
+              || zcat "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
+              || xz -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null
+            DATA=$(find /tmp/msw/outer -maxdepth 1 -name 'data.tar.*' | head -1)
+            if [ -n "$DATA" ]; then
+              tar xf "$DATA" -C /tmp/msw/data 2>/dev/null \
+                || zstd -dc "$DATA" 2>/dev/null | tar x -C /tmp/msw/data 2>/dev/null \
+                || zcat "$DATA" 2>/dev/null | tar x -C /tmp/msw/data 2>/dev/null
+            fi
             BIN=$(find /tmp/msw/data -type f -name 'usb_modeswitch' | head -1)
             if [ -n "$BIN" ]; then
               cp "$BIN" inject/opt/bin/usb_modeswitch
               chmod +x inject/opt/bin/usb_modeswitch
               echo ">>> usb_modeswitch 二进制已提取"
+            else
+              echo ">>> 未能从 ipk 提取 usb_modeswitch(把日志发我)"
             fi
           fi
           # 首次开机: 强制恢复被重打包清掉的文件 + 设默认中文
