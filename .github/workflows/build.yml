@@ -147,8 +147,9 @@ jobs:
           cd wrap && sha256sum *.tar.gz > sha256sums
           tar czf ${KV}.tar.gz boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz sha256sums
           echo ">>> 发布内核 Release (kernel_stable/${KV}.tar.gz)"
-          gh release delete kernel_stable --cleanup-tag -y 2>/dev/null || true
+          gh release delete kernel_stable --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create kernel_stable ${KV}.tar.gz \
+            --repo ${{ github.repository }} \
             -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
           # 释放磁盘空间
           rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src"
