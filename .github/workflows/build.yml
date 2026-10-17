@@ -31,7 +31,7 @@ jobs:
       - name: 查询 flippy 内核精确版本
         run: |
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
-               | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1)
+               | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1 || true)
           test -n "$KV" || { echo "查询 flippy 内核版本失败"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
           echo ">>> flippy 内核: 6.12.${KV}"
@@ -52,49 +52,51 @@ jobs:
           echo ">>> 源码版本: $(awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' Makefile | sed 's/\.$//') (目标 $KV)"
           curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/${KV}.tar.gz" -o /tmp/k.tar.gz
           tar xzf /tmp/k.tar.gz -C /tmp
-          BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1)
+          BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
           test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
-          mkdir -p /tmp/boot && tar xzf "${BOOT_TGZ}" -C /tmp/boot 2>/dev/null
+          mkdir -p /tmp/boot && tar xzf "${BOOT_TGZ}" -C /tmp/boot 2>/dev/null || true
           echo ">>> boot 包内容:"
-          find /tmp/boot -type f
-          zimg=$(find /tmp/boot -type f \( -name 'zImage*' -o -name 'vmlinuz*' -o -name 'Image*' -o -name 'vmlinux*' -o -name 'uImage*' \) 2>/dev/null | head -1)
+          find /tmp/boot -type f || true
+          zimg=$(find /tmp/boot -type f \( -name 'zImage*' -o -name 'vmlinuz*' -o -name 'Image*' -o -name 'vmlinux*' -o -name 'uImage*' \) 2>/dev/null | head -1 || true)
           test -n "$zimg" || { echo "boot 包里没有内核镜像,把日志发我"; exit 1; }
           echo ">>> 内核镜像: $zimg ($(stat -c%s "$zimg") 字节)"
           echo ">>> 镜像前 64 字节:"
-          od -A x -t x1z "$zimg" | head -4
-          # ===== v4 解包: 裸ELF / uImage头跳过 / 任意偏移ELF(限前2MB) / 多种压缩 =====
+          od -A x -t x1z "$zimg" 2>/dev/null | head -4 || true
           rm -f /tmp/vmlinux
           extract_vmlinux() {
             local f="$1" off o m cmd pair
-            head -c 4 "$f" | grep -q $'\x7fELF' && { cat "$f" > /tmp/vmlinux; return 0; }
-            if head -c 4 "$f" | grep -q "$(printf '\x27\x05\x19\x56')"; then
+            if head -c 4 "$f" 2>/dev/null | grep -q $'\x7fELF'; then
+              cat "$f" > /tmp/vmlinux; return 0
+            fi
+            if head -c 4 "$f" 2>/dev/null | grep -q "$(printf '\x27\x05\x19\x56')"; then
               echo ">>> 检测到 uImage 头,跳过 64 字节"
-              dd if="$f" of=/tmp/inner.$$ ibs=1 skip=64 2>/dev/null
+              dd if="$f" of=/tmp/inner.$$ ibs=1 skip=64 2>/dev/null || true
               if extract_vmlinux /tmp/inner.$$; then rm -f /tmp/inner.$$; return 0; fi
               rm -f /tmp/inner.$$
             fi
-            off=$(LC_ALL=C grep -abo $'\x7fELF' "$f" 2>/dev/null | awk -F: '$1 < 2097152 {print $1; exit}')
+            off=$(LC_ALL=C grep -abo $'\x7fELF' "$f" 2>/dev/null | awk -F: '$1 < 2097152 {print $1; exit}' || true)
             if [ -n "$off" ]; then
-              dd if="$f" bs=1 skip="$off" 2>/dev/null | cat > /tmp/vmlinux 2>/dev/null
-              head -c 4 /tmp/vmlinux | grep -q $'\x7fELF' && return 0
+              dd if="$f" bs=1 skip="$off" 2>/dev/null | cat > /tmp/vmlinux 2>/dev/null || true
+              if head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF'; then return 0; fi
             fi
             for pair in "$(printf '\x1f\x8b\x08')|zcat" \
                         "$(printf '\x28\xb5\x2f\xfd')|zstd -dc" \
                         "$(printf '\x02\x21\x4c\x18')|lz4 -dc" \
                         "$(printf '\x42\x5a\x68')|bzip2 -dc"; do
               m="${pair%%|*}"; cmd="${pair##*|}"
-              for o in $(LC_ALL=C grep -abo "$m" "$f" 2>/dev/null | head -3 | cut -d: -f1); do
-                dd if="$f" bs=1 skip="$o" 2>/dev/null | $cmd > /tmp/vmlinux 2>/dev/null
-                head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF' && return 0
+              for o in $(LC_ALL=C grep -abo "$m" "$f" 2>/dev/null | head -3 | cut -d: -f1 || true); do
+                dd if="$f" bs=1 skip="$o" 2>/dev/null | $cmd > /tmp/vmlinux 2>/dev/null || true
+                if head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF'; then return 0; fi
               done
             done
             return 1
           }
-          # 闸门1: 解出的 vmlinux 必须 > 10MB 且是 ELF
-          if extract_vmlinux "$zimg" \
-             && [ "$(stat -c%s /tmp/vmlinux 2>/dev/null || echo 0)" -gt 10000000 ] \
-             && head -c 4 /tmp/vmlinux | grep -q $'\x7fELF'; then
-            echo ">>> vmlinux 提取成功 ($(stat -c%s /tmp/vmlinux) 字节)"
+          VMSZ=0
+          if extract_vmlinux "$zimg"; then
+            VMSZ=$(stat -c%s /tmp/vmlinux 2>/dev/null || echo 0)
+          fi
+          if [ "$VMSZ" -gt 10000000 ] && head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF'; then
+            echo ">>> vmlinux 提取成功 (${VMSZ} 字节)"
             scripts/extract-ikconfig /tmp/vmlinux > /tmp/ikconfig 2>/dev/null || true
           else
             rm -f /tmp/vmlinux
@@ -104,14 +106,14 @@ jobs:
             cp /tmp/ikconfig .config
             echo ">>> 配置来源: IKCONFIG ($(wc -l < .config) 行)"
           else
-            CFG=$(tar tzf "${BOOT_TGZ}" | grep -m1 -i 'config')
-            tar xzf "${BOOT_TGZ}" -O "$CFG" > .config 2>/dev/null
-            echo ">>> 配置来源: boot 包 ($(wc -l < .config) 行)"
+            tar tzf "${BOOT_TGZ}" > /tmp/bootlist 2>/dev/null || true
+            CFG=$(grep -m1 -i 'config' /tmp/bootlist 2>/dev/null || true)
+            tar xzf "${BOOT_TGZ}" -O "$CFG" > .config 2>/dev/null || true
+            echo ">>> 配置来源: boot 包 ($(wc -l < .config 2>/dev/null || echo 0) 行)"
           fi
           test "$(wc -l < .config)" -gt 1000 || { echo ".config 无效,把日志发我"; exit 1; }
           echo ">>> 关键结构选项:"
           grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=|CONFIG_KALLSYMS=' .config || true
-          # 闸门2: 符号表必须 >= 500 行, 否则降级 WARN(运行时内核自行解析,不影响使用)
           SYM_OK=""
           if [ -s /tmp/vmlinux ]; then
             aarch64-linux-gnu-nm /tmp/vmlinux 2>/dev/null | awk '$3 ~ /^__ksymtab_/ {
@@ -119,13 +121,14 @@ jobs:
                 sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
                 sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
                 if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
-            }' | sort -u > Module.symvers
-            if [ "$(wc -l < Module.symvers)" -ge 500 ]; then
+            }' | sort -u > Module.symvers || true
+            SYMN=$(wc -l < Module.symvers 2>/dev/null || echo 0)
+            if [ "$SYMN" -ge 500 ]; then
               SYM_OK=1
-              echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
+              echo ">>> 内核导出符号数: $SYMN"
             else
-              echo ">>> 符号数过少($(wc -l < Module.symvers)),弃用"
-              rm -f Module.symvers
+              echo ">>> 符号数过少(${SYMN}),弃用"
+              rm -f Module.symvers || true
             fi
           fi
           if [ -z "$SYM_OK" ]; then
@@ -143,7 +146,7 @@ jobs:
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
           echo ">>> 驱动固件:"
-          ls aicsrc/fw/
+          ls aicsrc/fw/ || true
           if [ "${{ env.KMOD_WARN }}" = "1" ]; then
             make -C ksrc ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
               M=$PWD/aicsrc/drivers/aic8800 KBUILD_MODPOST_WARN=1 modules
@@ -151,28 +154,22 @@ jobs:
             make -C ksrc ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
               M=$PWD/aicsrc/drivers/aic8800 modules
           fi
-          find aicsrc -name '*.ko' | sort
+          find aicsrc -name '*.ko' | sort || true
           echo ">>> vermagic 校验(必须等于 ${{ env.KV }}):"
-          find aicsrc -name '*.ko' -exec modinfo {} \; | grep vermagic
+          find aicsrc -name '*.ko' -exec modinfo {} \; 2>/dev/null | grep vermagic || true
 
       - name: 组装驱动注入包
         run: |
           mkdir -p inject/opt/aic8800 inject/lib/firmware \
                    inject/etc/usb_modeswitch.d inject/etc/custom_service \
                    inject/etc/hotplug.d/usb inject/etc/profile.d
-          # 1. 驱动模块放 /opt/aic8800 —— 不能放 /lib/modules,
-          #    ophub 打包替换内核时会清空 /lib/modules,放那里会被删掉
-          find aicsrc -name '*.ko' -exec cp {} inject/opt/aic8800/ \;
-          # 2. 固件: /lib/firmware 一份 + /opt 备份一份(启动时自愈)
+          find aicsrc -name '*.ko' -exec cp {} inject/opt/aic8800/ \; || true
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           cp -r aicsrc/fw/. inject/opt/aic8800/fw/ 2>/dev/null || true
-          # 3. 1111:1111 假光盘模式的切换规则
           find aicsrc -path '*modeswitch*' -type f ! -name '*.md' \
             -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
-          # 4. 热插拔自动加载: 插入 AX900M 自动加载驱动,无需重启
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
-          # AX900M (AIC8800D80) 热插拔自动加载
           [ "$ACTION" = "add" ] || exit 0
           case "$PRODUCT" in
               a69c:8d80*|a69c:8d83*)
@@ -186,7 +183,6 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
-          # 5. 开机脚本: 确保完成模式切换(防止开机时热插拔事件没触发切换)
           cat > inject/etc/custom_service/start_service.sh <<'EOF'
           #!/bin/sh
           i=0
@@ -210,11 +206,10 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/custom_service/start_service.sh
-          # 6. 覆盖 ophub 有语法错误的登录横幅脚本
           printf '#!/bin/sh\n# 覆盖原脚本的 ash 语法报错\nexit 0\n' > inject/etc/profile.d/30-sysinfo.sh
           chmod +x inject/etc/profile.d/30-sysinfo.sh
           echo ">>> 注入包:"
-          find inject -type f | sort
+          find inject -type f | sort || true
 
       - name: 上传驱动模块包(免刷机热修用)
         uses: actions/upload-artifact@v4
@@ -227,6 +222,7 @@ jobs:
 
       - name: 准备中文语言包与切换工具(离线注入)
         run: |
+          sudo apt-get install -y libarchive-tools
           mkdir -p inject/opt/ipks inject/opt/bin inject/etc/uci-defaults
           REL="${{ github.event.inputs.openwrt_version }}"
           REL="${REL#v}"
@@ -234,7 +230,7 @@ jobs:
           download_ipk() {
             local sub="$1" pkg="$2" file
             file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
-                   | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}')
+                   | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}' || true)
             case "$file" in
               */*) ;;
               *) file="${sub}/${file}" ;;
@@ -250,32 +246,37 @@ jobs:
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
           download_ipk packages usb-modeswitch
-          ls -la inject/opt/ipks/
-          # 从 ipk 里取出 usb_modeswitch 二进制备份到 /opt/bin
-          # (系统里的 usb_modeswitch 会被重打包清掉,/opt 安全)
+          ls -la inject/opt/ipks/ || true
           if [ -s inject/opt/ipks/usb-modeswitch.ipk ]; then
             rm -rf /tmp/msw && mkdir -p /tmp/msw/outer /tmp/msw/data
             IPK="$PWD/inject/opt/ipks/usb-modeswitch.ipk"
-            tar xf "$IPK" -C /tmp/msw/outer 2>/dev/null \
+            echo ">>> ipk 文件类型诊断:"
+            file "$IPK" || true
+            od -A x -t x1z "$IPK" 2>/dev/null | head -2 || true
+            bsdtar xf "$IPK" -C /tmp/msw/outer 2>/dev/null \
+              || tar xf "$IPK" -C /tmp/msw/outer 2>/dev/null \
               || zstd -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
               || zcat "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
-              || xz -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null
-            DATA=$(find /tmp/msw/outer -maxdepth 1 -name 'data.tar.*' | head -1)
+              || xz -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
+              || (cd /tmp/msw/outer && ar x "$IPK" 2>/dev/null) \
+              || true
+            DATA=$(find /tmp/msw/outer -maxdepth 1 -name 'data.tar.*' | head -1 || true)
             if [ -n "$DATA" ]; then
-              tar xf "$DATA" -C /tmp/msw/data 2>/dev/null \
+              bsdtar xf "$DATA" -C /tmp/msw/data 2>/dev/null \
+                || tar xf "$DATA" -C /tmp/msw/data 2>/dev/null \
                 || zstd -dc "$DATA" 2>/dev/null | tar x -C /tmp/msw/data 2>/dev/null \
-                || zcat "$DATA" 2>/dev/null | tar x -C /tmp/msw/data 2>/dev/null
+                || zcat "$DATA" 2>/dev/null | tar x -C /tmp/msw/data 2>/dev/null \
+                || true
             fi
-            BIN=$(find /tmp/msw/data -type f -name 'usb_modeswitch' | head -1)
+            BIN=$(find /tmp/msw/data -type f -name 'usb_modeswitch' | head -1 || true)
             if [ -n "$BIN" ]; then
               cp "$BIN" inject/opt/bin/usb_modeswitch
               chmod +x inject/opt/bin/usb_modeswitch
               echo ">>> usb_modeswitch 二进制已提取"
             else
-              echo ">>> 未能从 ipk 提取 usb_modeswitch(把日志发我)"
+              echo ">>> 未能从 ipk 提取 usb_modeswitch(把'文件类型诊断'输出发我)"
             fi
           fi
-          # 首次开机: 强制恢复被重打包清掉的文件 + 设默认中文
           cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
           #!/bin/sh
           opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
@@ -329,8 +330,8 @@ jobs:
           cd openwrt
           make -j$(nproc) || make -j1 V=s
           ls -lh bin/targets/armsr/armv8/*rootfs.tar.gz
-          echo ">>> rootfs 内容检查(usb_modeswitch/中文/mwan3 是否真编进去了):"
-          tar tzf bin/targets/armsr/armv8/*rootfs.tar.gz | grep -E 'usb_modeswitch|zh-cn|mwan3' | sort
+          echo ">>> rootfs 内容检查:"
+          tar tzf bin/targets/armsr/armv8/*rootfs.tar.gz | grep -E 'usb_modeswitch|zh-cn|mwan3' | sort || true
 
       - name: 升级 coreutils(ophub 脚本需要新版 cp 语法)
         run: |
@@ -341,7 +342,7 @@ jobs:
           sudo make install >/dev/null
           hash -r
           cp --version | head -1
-          cp --update=none --version >/dev/null && echo ">>> cp --update=none 已支持"
+          cp --update=none --version >/dev/null && echo ">>> cp --update=none 已支持" || true
 
       - name: 打包 N1 固件(ophub)
         uses: ophub/amlogic-s9xxx-openwrt@main
