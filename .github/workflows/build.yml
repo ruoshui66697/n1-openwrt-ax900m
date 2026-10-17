@@ -160,27 +160,37 @@ jobs:
 
       - name: 编译 usb_modeswitch 静态二进制
         run: |
-          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
-          if [ -d libusb-src ]; then
-            cd libusb-src
-            (./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared \
-              --disable-udev --prefix=/tmp/usbroot >/dev/null 2>&1) \
-              || (./bootstrap.sh >/dev/null 2>&1 \
-                  && ./configure --host=aarch64-linux-gnu --enable-static --disable-shared \
-                     --disable-udev --prefix=/tmp/usbroot >/dev/null)
-            make -j$(nproc) >/dev/null 2>&1 || true
-            make install >/dev/null 2>&1 || true
-            cd ..
+          sudo apt-get install -y autoconf automake libtool pkg-config m4
+          # 1. libusb-1.0 静态库(交叉编译,需要 autotools)
+          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src
+          cd libusb-src
+          if [ -x ./autogen.sh ]; then
+            ./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared \
+              --disable-udev --prefix=/tmp/usbroot
+          else
+            ./bootstrap.sh
+            ./configure --host=aarch64-linux-gnu --enable-static --disable-shared \
+              --disable-udev --prefix=/tmp/usbroot
           fi
+          make -j$(nproc)
+          make install
+          cd ..
+          test -f /tmp/usbroot/lib/libusb-1.0.a && echo ">>> libusb 静态库 OK ($(stat -c%s /tmp/usbroot/lib/libusb-1.0.a) 字节)"
+          # 2. usb_modeswitch 直接调 gcc(绕开 Makefile 的 pkg-config 依赖)
           curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
           tar xjf /tmp/ums.tar.bz2 -C /tmp
           cd /tmp/usb-modeswitch-2.6.1
-          make CC=aarch64-linux-gnu-gcc \
-               CFLAGS="-O2 -I/tmp/usbroot/include/libusb-1.0 -I/tmp/usbroot/include" \
-               LDFLAGS="-static -L/tmp/usbroot/lib" >/dev/null 2>&1 || \
-          make CC=aarch64-linux-gnu-gcc \
-               CFLAGS="-O2 -I/tmp/usbroot/include/libusb-1.0 -I/tmp/usbroot/include" \
-               LDFLAGS="-static -L/tmp/usbroot/lib"
+          set +e
+          aarch64-linux-gnu-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c \
+            -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib \
+            -lusb-1.0 -lpthread
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ]; then
+            echo ">>> 静态编译失败(rc=$RC),把上面报错发我"
+          else
+            echo ">>> usb_modeswitch 编译成功"
+          fi
           ls -la usb_modeswitch || true
           file usb_modeswitch || true
           cp usb_modeswitch "$OLDPWD/" 2>/dev/null || true
