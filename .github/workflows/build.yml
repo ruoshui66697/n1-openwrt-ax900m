@@ -62,7 +62,7 @@ jobs:
           echo ">>> 内核镜像: $zimg ($(stat -c%s "$zimg") 字节)"
           echo ">>> 镜像前 64 字节:"
           od -A x -t x1z "$zimg" | head -4
-          # ===== v4 解包: 裸ELF / uImage头跳过 / 任意偏移ELF / 多种压缩 =====
+          # ===== v4 解包: 裸ELF / uImage头跳过 / 任意偏移ELF(限前2MB) / 多种压缩 =====
           rm -f /tmp/vmlinux
           extract_vmlinux() {
             local f="$1" off o m cmd pair
@@ -73,7 +73,7 @@ jobs:
               if extract_vmlinux /tmp/inner.$$; then rm -f /tmp/inner.$$; return 0; fi
               rm -f /tmp/inner.$$
             fi
-            off=$(LC_ALL=C grep -abo $'\x7fELF' "$f" 2>/dev/null | head -1 | cut -d: -f1)
+            off=$(LC_ALL=C grep -abo $'\x7fELF' "$f" 2>/dev/null | awk -F: '$1 < 2097152 {print $1; exit}')
             if [ -n "$off" ]; then
               dd if="$f" bs=1 skip="$off" 2>/dev/null | cat > /tmp/vmlinux 2>/dev/null
               head -c 4 /tmp/vmlinux | grep -q $'\x7fELF' && return 0
@@ -90,10 +90,14 @@ jobs:
             done
             return 1
           }
-          if extract_vmlinux "$zimg" && [ -s /tmp/vmlinux ]; then
+          # 闸门1: 解出的 vmlinux 必须 > 10MB 且是 ELF
+          if extract_vmlinux "$zimg" \
+             && [ "$(stat -c%s /tmp/vmlinux 2>/dev/null || echo 0)" -gt 10000000 ] \
+             && head -c 4 /tmp/vmlinux | grep -q $'\x7fELF'; then
             echo ">>> vmlinux 提取成功 ($(stat -c%s /tmp/vmlinux) 字节)"
             scripts/extract-ikconfig /tmp/vmlinux > /tmp/ikconfig 2>/dev/null || true
           else
+            rm -f /tmp/vmlinux
             echo ">>> 未能解包内核镜像(降级处理,把上面'镜像前64字节'发我)"
           fi
           if [ -s /tmp/ikconfig ] && [ "$(wc -l < /tmp/ikconfig)" -gt 1000 ]; then
@@ -107,16 +111,25 @@ jobs:
           test "$(wc -l < .config)" -gt 1000 || { echo ".config 无效,把日志发我"; exit 1; }
           echo ">>> 关键结构选项:"
           grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=|CONFIG_KALLSYMS=' .config || true
-          if [ -s /tmp/vmlinux ] && head -c 4 /tmp/vmlinux | grep -q $'\x7fELF'; then
-            aarch64-linux-gnu-nm /tmp/vmlinux | awk '$3 ~ /^__ksymtab_/ {
+          # 闸门2: 符号表必须 >= 500 行, 否则降级 WARN(运行时内核自行解析,不影响使用)
+          SYM_OK=""
+          if [ -s /tmp/vmlinux ]; then
+            aarch64-linux-gnu-nm /tmp/vmlinux 2>/dev/null | awk '$3 ~ /^__ksymtab_/ {
                 s=$3; sub(/^__ksymtab_/,"",s);
                 sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
                 sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
                 if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
             }' | sort -u > Module.symvers
-            echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
-          else
-            echo ">>> 无 vmlinux,驱动编译将使用 KBUILD_MODPOST_WARN"
+            if [ "$(wc -l < Module.symvers)" -ge 500 ]; then
+              SYM_OK=1
+              echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
+            else
+              echo ">>> 符号数过少($(wc -l < Module.symvers)),弃用"
+              rm -f Module.symvers
+            fi
+          fi
+          if [ -z "$SYM_OK" ]; then
+            echo ">>> 驱动编译将使用 KBUILD_MODPOST_WARN"
             echo "KMOD_WARN=1" >> $GITHUB_ENV
           fi
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
