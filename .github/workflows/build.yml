@@ -19,6 +19,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - name: 安装编译依赖
         run: |
@@ -26,22 +28,36 @@ jobs:
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gettext git libncurses-dev libssl-dev \
             python3-setuptools rsync swig unzip zlib1g-dev file wget \
-            gcc-aarch64-linux-gnu bc libelf-dev kmod bzip2
+            gcc-aarch64-linux-gnu bc libelf-dev kmod bzip2 \
+            zstd lz4 u-boot-tools cpio
 
-      - name: 查询 flippy 内核精确版本
+      - name: 查询 flippy 内核版本并获取内核配置
         run: |
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
                | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1 || true)
           test -n "$KV" || { echo "查询 flippy 内核版本失败"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
           echo ">>> flippy 内核: 6.12.${KV}"
+          # 下载官方内核包,只为取里面的 .config(构建配置必须与之一致)
+          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/6.12.${KV}.tar.gz" -o /tmp/k.tar.gz
+          tar xzf /tmp/k.tar.gz -C /tmp
+          BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
+          test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
+          tar tzf "${BOOT_TGZ}" > /tmp/bootlist 2>/dev/null || true
+          CFG=$(grep -m1 -i '^config' /tmp/bootlist 2>/dev/null || true)
+          test -n "$CFG" || { echo "boot 包里没有 config 文件,把日志发我"; exit 1; }
+          mkdir -p ksrc
+          tar xzf "${BOOT_TGZ}" -O "$CFG" > ksrc/.config 2>/dev/null || true
+          test "$(wc -l < ksrc/.config)" -gt 1000 || { echo ".config 无效,把日志发我"; exit 1; }
+          echo ">>> 内核配置已获取 ($(wc -l < ksrc/.config) 行)"
+          grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=' ksrc/.config || true
 
-      - name: 准备 flippy 内核构建树
+      - name: 准备内核源码与 AX900M 驱动源码
         run: |
-          sudo apt-get install -y zstd lz4
-          git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc
-          cd ksrc
+          rm -rf ksrc-src && git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc-src
+          cd ksrc-src
           KV="${{ env.KV }}"
+          # 源码锁定到与发布版本一致的提交
           for c in $(git rev-list -n 5 HEAD); do
             V=$(git show "$c:Makefile" 2>/dev/null | awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' | sed 's/\.$//')
             if [ "$V" = "$KV" ]; then
@@ -50,172 +66,117 @@ jobs:
             fi
           done
           echo ">>> 源码版本: $(awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' Makefile | sed 's/\.$//') (目标 $KV)"
-          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/${KV}.tar.gz" -o /tmp/k.tar.gz
-          tar xzf /tmp/k.tar.gz -C /tmp
-          BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
-          test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
-          mkdir -p /tmp/boot && tar xzf "${BOOT_TGZ}" -C /tmp/boot 2>/dev/null || true
-          echo ">>> boot 包内容:"
-          find /tmp/boot -type f || true
-          zimg=$(find /tmp/boot -type f \( -name 'zImage*' -o -name 'vmlinuz*' -o -name 'Image*' -o -name 'vmlinux*' -o -name 'uImage*' \) 2>/dev/null | head -1 || true)
-          test -n "$zimg" || { echo "boot 包里没有内核镜像,把日志发我"; exit 1; }
-          echo ">>> 内核镜像: $zimg ($(stat -c%s "$zimg") 字节)"
-          echo ">>> 镜像前 64 字节:"
-          od -A x -t x1z "$zimg" 2>/dev/null | head -4 || true
-          rm -f /tmp/vmlinux
-          extract_vmlinux() {
-            local f="$1" off o m cmd pair
-            if head -c 4 "$f" 2>/dev/null | grep -q $'\x7fELF'; then
-              cat "$f" > /tmp/vmlinux; return 0
-            fi
-            if head -c 4 "$f" 2>/dev/null | grep -q "$(printf '\x27\x05\x19\x56')"; then
-              echo ">>> 检测到 uImage 头,跳过 64 字节"
-              dd if="$f" of=/tmp/inner.$$ ibs=1 skip=64 2>/dev/null || true
-              if extract_vmlinux /tmp/inner.$$; then rm -f /tmp/inner.$$; return 0; fi
-              rm -f /tmp/inner.$$
-            fi
-            off=$(LC_ALL=C grep -abo $'\x7fELF' "$f" 2>/dev/null | awk -F: '$1 < 2097152 {print $1; exit}' || true)
-            if [ -n "$off" ]; then
-              dd if="$f" bs=1 skip="$off" 2>/dev/null | cat > /tmp/vmlinux 2>/dev/null || true
-              if head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF'; then return 0; fi
-            fi
-            for pair in "$(printf '\x1f\x8b\x08')|zcat" \
-                        "$(printf '\x28\xb5\x2f\xfd')|zstd -dc" \
-                        "$(printf '\x02\x21\x4c\x18')|lz4 -dc" \
-                        "$(printf '\x42\x5a\x68')|bzip2 -dc"; do
-              m="${pair%%|*}"; cmd="${pair##*|}"
-              for o in $(LC_ALL=C grep -abo "$m" "$f" 2>/dev/null | head -3 | cut -d: -f1 || true); do
-                dd if="$f" bs=1 skip="$o" 2>/dev/null | $cmd > /tmp/vmlinux 2>/dev/null || true
-                if head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF'; then return 0; fi
-              done
-            done
-            return 1
-          }
-          VMSZ=0
-          if extract_vmlinux "$zimg"; then
-            VMSZ=$(stat -c%s /tmp/vmlinux 2>/dev/null || echo 0)
-          fi
-          if [ "$VMSZ" -gt 10000000 ] && head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF'; then
-            echo ">>> vmlinux 提取成功 (${VMSZ} 字节)"
-            scripts/extract-ikconfig /tmp/vmlinux > /tmp/ikconfig 2>/dev/null || true
-          else
-            rm -f /tmp/vmlinux
-            echo ">>> 未能解包内核镜像(降级处理,把上面'镜像前64字节'发我)"
-          fi
-          if [ -s /tmp/ikconfig ] && [ "$(wc -l < /tmp/ikconfig)" -gt 1000 ]; then
-            cp /tmp/ikconfig .config
-            echo ">>> 配置来源: IKCONFIG ($(wc -l < .config) 行)"
-          else
-            tar tzf "${BOOT_TGZ}" > /tmp/bootlist 2>/dev/null || true
-            CFG=$(grep -m1 -i 'config' /tmp/bootlist 2>/dev/null || true)
-            tar xzf "${BOOT_TGZ}" -O "$CFG" > .config 2>/dev/null || true
-            echo ">>> 配置来源: boot 包 ($(wc -l < .config 2>/dev/null || echo 0) 行)"
-          fi
-          test "$(wc -l < .config)" -gt 1000 || { echo ".config 无效,把日志发我"; exit 1; }
-          echo ">>> 关键结构选项:"
-          grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=|CONFIG_KALLSYMS=' .config || true
-          SYM_OK=""
-          if [ -s /tmp/vmlinux ]; then
-            aarch64-linux-gnu-nm /tmp/vmlinux 2>/dev/null | awk '$3 ~ /^__ksymtab_/ {
-                s=$3; sub(/^__ksymtab_/,"",s);
-                sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
-                sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
-                if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
-            }' | sort -u > Module.symvers || true
-            SYMN=$(wc -l < Module.symvers 2>/dev/null || echo 0)
-            if [ "$SYMN" -ge 500 ]; then
-              SYM_OK=1
-              echo ">>> 内核导出符号数: $SYMN"
-            else
-              echo ">>> 符号数过少(${SYMN}),弃用"
-              rm -f Module.symvers || true
-            fi
-          fi
-          if [ -z "$SYM_OK" ]; then
-            echo ">>> 驱动编译将使用 KBUILD_MODPOST_WARN"
-            echo "KMOD_WARN=1" >> $GITHUB_ENV
-          fi
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
-          echo "${KV}" > include/config/kernel.release
-          sed -i "s/UTS_RELEASE \".*\"/UTS_RELEASE \"${KV}\"/" include/generated/utsrelease.h
-          echo ">>> 内核构建树: $(cat include/config/kernel.release)"
-
-      - name: 编译 AX900M 驱动(against flippy 内核)
-        run: |
+          # 放入官方配置,去掉 -ophub 后缀(保证版本号与 ophub 匹配规则兼容)
+          rm -f .config
+          mv ../ksrc/.config .
+          scripts/config --set-str LOCALVERSION ""
+          cd ..
+          # AX900M 驱动源码
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
-          echo ">>> 驱动固件:"
-          ls aicsrc/fw/ || true
-          if [ "${{ env.KMOD_WARN }}" = "1" ]; then
-            make -C ksrc ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-              M=$PWD/aicsrc/drivers/aic8800 KBUILD_MODPOST_WARN=1 modules
-          else
-            make -C ksrc ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-              M=$PWD/aicsrc/drivers/aic8800 modules
-          fi
-          find aicsrc -name '*.ko' | sort || true
-          echo ">>> vermagic 校验(必须等于 ${{ env.KV }}):"
-          find aicsrc -name '*.ko' -exec modinfo {} \; 2>/dev/null | grep vermagic || true
+          echo ">>> 驱动固件:"; ls aicsrc/fw/ || true
+
+      - name: 完整编译内核(内核+dtb+模块+AX900M驱动,同一构建树)
+        run: |
+          cd ksrc-src
+          KV="${{ env.KV }}"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
+          make ARCH=arm64 INSTALL_MOD_PATH=/tmp/kmod modules_install
+          # AX900M 驱动与内核同源编译,混入模块树
+          mkdir -p /tmp/kmod/lib/modules/${KV}/extra/aic8800
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules
+          cp ../aicsrc/drivers/aic8800/aic_load_fw.ko \
+             ../aicsrc/drivers/aic8800/aic8800_fdrv.ko \
+             ../aicsrc/drivers/aic8800/aic_zlp_quirk.ko \
+             /tmp/kmod/lib/modules/${KV}/extra/aic8800/
+          depmod -b /tmp/kmod ${KV}
+          echo ">>> 内核: $(make -s kernelversion)"
+          echo ">>> AX900M 驱动已编入模块树:"
+          ls -la /tmp/kmod/lib/modules/${KV}/extra/aic8800/
 
       - name: 编译 usb_modeswitch 静态二进制
         run: |
-          sudo apt-get install -y autoconf automake libtool pkg-config m4
-          # 1. libusb-1.0 静态库(交叉编译,需要 autotools)
-          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src
-          cd libusb-src
-          if [ -x ./autogen.sh ]; then
-            ./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared \
-              --disable-udev --prefix=/tmp/usbroot
-          else
-            ./bootstrap.sh
-            ./configure --host=aarch64-linux-gnu --enable-static --disable-shared \
-              --disable-udev --prefix=/tmp/usbroot
+          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
+          if [ -d libusb-src ]; then
+            cd libusb-src
+            if [ -x ./autogen.sh ]; then
+              ./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared \
+                --disable-udev --prefix=/tmp/usbroot >/dev/null
+            else
+              ./bootstrap.sh && ./configure --host=aarch64-linux-gnu \
+                --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
+            fi
+            make -j$(nproc) >/dev/null && make install >/dev/null
+            cd ..
           fi
-          make -j$(nproc)
-          make install
-          cd ..
-          test -f /tmp/usbroot/lib/libusb-1.0.a && echo ">>> libusb 静态库 OK ($(stat -c%s /tmp/usbroot/lib/libusb-1.0.a) 字节)"
-          # 2. usb_modeswitch 直接调 gcc(绕开 Makefile 的 pkg-config 依赖)
           curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
           tar xjf /tmp/ums.tar.bz2 -C /tmp
           cd /tmp/usb-modeswitch-2.6.1
           set +e
           aarch64-linux-gnu-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c \
-            -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib \
-            -lusb-1.0 -lpthread
+            -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread
           RC=$?
           set -e
-          if [ $RC -ne 0 ]; then
-            echo ">>> 静态编译失败(rc=$RC),把上面报错发我"
-          else
-            echo ">>> usb_modeswitch 编译成功"
-          fi
+          [ $RC -eq 0 ] && echo ">>> usb_modeswitch 编译成功" || echo ">>> usb_modeswitch 编译失败(rc=$RC)"
           ls -la usb_modeswitch || true
           file usb_modeswitch || true
           cp usb_modeswitch "$OLDPWD/" 2>/dev/null || true
 
-      - name: 组装驱动注入包
+      - name: 打包内核并发布 Release(ophub 格式)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p inject/opt/aic8800 inject/opt/bin inject/lib/firmware \
+          KV="${{ env.KV }}"
+          cd ksrc-src
+          test -f arch/arm64/boot/Image || { echo "内核未编译成功"; exit 1; }
+          mkdir -p /tmp/rel/boot /tmp/rel/dtb
+          cp arch/arm64/boot/Image /tmp/rel/boot/vmlinuz-${KV}
+          cp .config /tmp/rel/boot/config-${KV}
+          cp System.map /tmp/rel/boot/System.map-${KV}
+          # 最小 initramfs(空 cpio,内核无 /init 时自动回退 root= 挂载)
+          rm -rf /tmp/initrd && mkdir -p /tmp/initrd
+          (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
+          mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz \
+            /tmp/rel/boot/uInitrd-${KV} 2>/dev/null || cp /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
+          # amlogic 全部 dtb(ophub 要求 dtb/amlogic 下至少 2 个文件)
+          cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
+          cd /tmp/rel
+          tar czf boot-${KV}.tar.gz -C boot .
+          tar czf dtb-amlogic-${KV}.tar.gz -C dtb .
+          tar czf modules-${KV}.tar.gz -C /tmp/kmod/lib/modules ${KV}
+          ls -lh *.tar.gz
+          mkdir -p wrap && mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/
+          cd wrap && sha256sum *.tar.gz > sha256sums
+          tar czf ${KV}.tar.gz boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz sha256sums
+          echo ">>> 发布内核 Release (kernel_stable/${KV}.tar.gz)"
+          gh release delete kernel_stable --cleanup-tag -y 2>/dev/null || true
+          gh release create kernel_stable ${KV}.tar.gz \
+            -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
+          # 释放磁盘空间
+          rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src"
+          df -h "$GITHUB_WORKSPACE" | tail -1
+
+      - name: 组装注入包
+        run: |
+          mkdir -p inject/opt/bin inject/lib/firmware \
                    inject/etc/usb_modeswitch.d inject/etc/custom_service \
                    inject/etc/hotplug.d/usb inject/etc/profile.d
-          find aicsrc -name '*.ko' -exec cp {} inject/opt/aic8800/ \; || true
-          cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
-          cp -r aicsrc/fw/. inject/opt/aic8800/fw/ 2>/dev/null || true
           cp usb_modeswitch inject/opt/bin/ 2>/dev/null || true
+          cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           find aicsrc -path '*modeswitch*' -type f ! -name '*.md' \
             -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
+          # AX900M (AIC8800D80) 热插拔自动加载(驱动已随内核模块树安装)
           [ "$ACTION" = "add" ] || exit 0
           case "$PRODUCT" in
               a69c:8d80*|a69c:8d83*)
-                  insmod /opt/aic8800/aic_load_fw.ko 2>/dev/null ;;
+                  modprobe aic_load_fw 2>/dev/null ;;
               a69c:8d81*|368b:8d81*)
                   modprobe cfg80211 2>/dev/null
-                  insmod /opt/aic8800/aic8800_fdrv.ko 2>/dev/null
-                  insmod /opt/aic8800/aic_zlp_quirk.ko 2>/dev/null
+                  modprobe aic8800_fdrv 2>/dev/null
+                  modprobe aic_zlp_quirk 2>/dev/null
                   modprobe btusb 2>/dev/null ;;
           esac
           exit 0
@@ -223,6 +184,7 @@ jobs:
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           cat > inject/etc/custom_service/start_service.sh <<'EOF'
           #!/bin/sh
+          # 等待 AX900M 完成模式切换(驱动已由热插拔脚本自动加载)
           i=0
           while [ $i -lt 40 ]; do
               lsusb | grep -qiE 'a69c|368b' && break
@@ -233,14 +195,6 @@ jobs:
               fi
               sleep 3; i=$((i+3))
           done
-          sleep 2
-          [ -d /lib/firmware/aic8800D80 ] || cp -r /opt/aic8800/fw/. /lib/firmware/ 2>/dev/null
-          modprobe cfg80211 2>/dev/null
-          insmod /opt/aic8800/aic_load_fw.ko 2>/dev/null
-          sleep 3
-          insmod /opt/aic8800/aic8800_fdrv.ko 2>/dev/null
-          insmod /opt/aic8800/aic_zlp_quirk.ko 2>/dev/null
-          modprobe btusb 2>/dev/null
           exit 0
           EOF
           chmod +x inject/etc/custom_service/start_service.sh
@@ -248,14 +202,13 @@ jobs:
           echo ">>> 注入包:"
           find inject -type f | sort || true
           ls -la inject/opt/bin/ || true
+          rm -rf aicsrc
 
-      - name: 上传驱动模块包(免刷机热修用)
+      - name: 上传救急工具包
         uses: actions/upload-artifact@v4
         with:
           name: ax900m-modules
-          path: |
-            inject/opt/aic8800/
-            inject/opt/bin/
+          path: inject/opt/bin/
           if-no-files-found: error
 
       - name: 准备中文语言包(离线注入)
@@ -336,8 +289,6 @@ jobs:
           cd openwrt
           make -j$(nproc) || make -j1 V=s
           ls -lh bin/targets/armsr/armv8/*rootfs.tar.gz
-          echo ">>> rootfs 内容检查:"
-          tar tzf bin/targets/armsr/armv8/*rootfs.tar.gz | grep -E 'usb_modeswitch|zh-cn|mwan3' | sort || true
 
       - name: 升级 coreutils(ophub 脚本需要新版 cp 语法)
         run: |
@@ -350,11 +301,12 @@ jobs:
           cp --version | head -1
           cp --update=none --version >/dev/null && echo ">>> cp --update=none 已支持" || true
 
-      - name: 打包 N1 固件(ophub)
+      - name: 打包 N1 固件(使用自编译内核)
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
           openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
           openwrt_board: s905d
+          kernel_repo: ${{ github.repository }}
           openwrt_kernel: ${{ env.KV }}
           auto_kernel: false
           openwrt_files: inject
