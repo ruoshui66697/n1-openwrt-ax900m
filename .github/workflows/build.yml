@@ -86,10 +86,7 @@ jobs:
           # AX900M 驱动与内核同源编译,混入模块树
           mkdir -p /tmp/kmod/lib/modules/${KV}/extra/aic8800
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules
-          cp ../aicsrc/drivers/aic8800/aic_load_fw.ko \
-             ../aicsrc/drivers/aic8800/aic8800_fdrv.ko \
-             ../aicsrc/drivers/aic8800/aic_zlp_quirk.ko \
-             /tmp/kmod/lib/modules/${KV}/extra/aic8800/
+          find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KV}/extra/aic8800/ \;
           depmod -b /tmp/kmod ${KV}
           echo ">>> 内核: $(make -s kernelversion)"
           echo ">>> AX900M 驱动已编入模块树:"
