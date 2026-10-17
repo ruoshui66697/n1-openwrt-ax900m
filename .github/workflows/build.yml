@@ -28,50 +28,6 @@ jobs:
             python3-setuptools rsync swig unzip zlib1g-dev file wget \
             gcc-aarch64-linux-gnu bc libelf-dev kmod
 
-      - name: 克隆 OpenWrt 源码
-        run: |
-          git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} \
-            https://github.com/openwrt/openwrt.git openwrt
-          cd openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: 生成配置(无需仓库内 config 文件)
-        run: |
-          cd openwrt
-          cat > .config <<'EOF'
-          CONFIG_TARGET_armsr=y
-          CONFIG_TARGET_armsr_armv8=y
-          CONFIG_TARGET_ROOTFS_TARGZ=y
-          CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-          CONFIG_PACKAGE_wpad-mbedtls=y
-          CONFIG_PACKAGE_iw=y
-          CONFIG_PACKAGE_iwinfo=y
-          CONFIG_PACKAGE_bluez-daemon=y
-          CONFIG_PACKAGE_bluez-utils=y
-          CONFIG_PACKAGE_usb-modeswitch=y
-          CONFIG_PACKAGE_usbutils=y
-          CONFIG_PACKAGE_mwan3=y
-          CONFIG_PACKAGE_luci-app-mwan3=y
-          CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
-          EOF
-          sed -i 's/^          //' .config
-          make defconfig
-
-      - name: 下载源码包
-        run: |
-          cd openwrt
-          make download -j$(nproc) || make download -j1 V=s
-
-      - name: 编译 OpenWrt rootfs
-        run: |
-          cd openwrt
-          make -j$(nproc) || make -j1 V=s
-          ls -lh bin/targets/armsr/armv8/*rootfs.tar.gz
-          echo ">>> rootfs 内容检查(usb_modeswitch/中文/mwan3 是否真编进去了):"
-          tar tzf bin/targets/armsr/armv8/*rootfs.tar.gz | grep -E 'usb_modeswitch|zh-cn|mwan3' | sort
-          
       - name: 查询 flippy 内核精确版本
         run: |
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
@@ -85,39 +41,78 @@ jobs:
           sudo apt-get install -y zstd lz4
           git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc
           cd ksrc
-          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/${{ env.KV }}.tar.gz" -o /tmp/k.tar.gz
+          KV="${{ env.KV }}"
+          # 源码尽量锁定到与发布内核一致的版本
+          for c in $(git rev-list -n 5 HEAD); do
+            V=$(git show "$c:Makefile" 2>/dev/null | awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' | sed 's/\.$//')
+            if [ "$V" = "$KV" ]; then
+              [ "$c" != "$(git rev-parse HEAD)" ] && git checkout -q "$c"
+              break
+            fi
+          done
+          echo ">>> 源码版本: $(awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' Makefile | sed 's/\.$//') (目标 $KV)"
+          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/${KV}.tar.gz" -o /tmp/k.tar.gz
           tar xzf /tmp/k.tar.gz -C /tmp
           BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1)
           test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
           mkdir -p /tmp/boot && tar xzf "${BOOT_TGZ}" -C /tmp/boot 2>/dev/null
-          zimg=$(find /tmp/boot \( -name 'zImage*' -o -name 'vmlinuz*' \) 2>/dev/null | head -1)
-          test -n "$zimg" || { echo "boot 包中没有 zImage,把日志发我"; exit 1; }
-          scripts/extract-vmlinux "$zimg" > /tmp/vmlinux
-          test -s /tmp/vmlinux || { echo "内核镜像解包失败,把日志发我"; exit 1; }
-          # 关键: 用内核镜像内置的 IKCONFIG(运行内核的绝对真实配置)
-          if scripts/extract-ikconfig /tmp/vmlinux > /tmp/ikconfig 2>/dev/null \
-             && [ "$(wc -l < /tmp/ikconfig)" -gt 1000 ]; then
-            cp /tmp/ikconfig .config
-            echo ">>> 使用 IKCONFIG ($(wc -l < .config) 行)"
+          echo ">>> boot 包内容:"
+          find /tmp/boot -type f | head -20
+          zimg=$(find /tmp/boot -type f \( -name 'zImage*' -o -name 'vmlinuz*' -o -name 'Image*' -o -name 'vmlinux*' \) 2>/dev/null | head -1)
+          test -n "$zimg" || { echo "boot 包里没有内核镜像,把日志发我"; exit 1; }
+          echo ">>> 内核镜像: $zimg ($(stat -c%s "$zimg") 字节)"
+          # 多策略解包: 裸ELF / gzip / zstd / lz4 / bzip2
+          rm -f /tmp/vmlinux
+          if head -c 4 "$zimg" | grep -q $'\x7fELF'; then
+            cp "$zimg" /tmp/vmlinux
           else
-            CFG=$(tar tzf "${BOOT_TGZ}" | grep -m1 -i '^boot/config')
-            tar xzf "${BOOT_TGZ}" -O "$CFG" > .config
-            echo ">>> 使用 boot 包 config ($(wc -l < .config) 行)"
+            try_magic() {
+              local m="$1" cmd="$2" off
+              for off in $(LC_ALL=C grep -abo "$m" "$zimg" 2>/dev/null | head -3 | cut -d: -f1); do
+                dd if="$zimg" bs=1 skip="$off" 2>/dev/null | $cmd > /tmp/vmlinux 2>/dev/null
+                head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF' && return 0
+              done
+              return 1
+            }
+            try_magic "$(printf '\x1f\x8b\x08')" "zcat" \
+            || try_magic "$(printf '\x28\xb5\x2f\xfd')" "zstd -dc" \
+            || try_magic "$(printf '\x02\x21\x4c\x18')" "lz4 -dc" \
+            || try_magic "$(printf '\x42\x5a\x68')" "bzip2 -dc" \
+            || echo ">>> 未能解包内核镜像(降级处理,日志发我)"
           fi
-          test "$(wc -l < .config)" -gt 1000 || { echo ".config 不完整,把日志发我"; exit 1; }
+          # 配置: 优先 IKCONFIG(内核里嵌的绝对真实配置)
+          if [ -s /tmp/vmlinux ] && head -c 4 /tmp/vmlinux | grep -q $'\x7fELF'; then
+            echo ">>> vmlinux 提取成功 ($(stat -c%s /tmp/vmlinux) 字节)"
+            scripts/extract-ikconfig /tmp/vmlinux > /tmp/ikconfig 2>/dev/null || true
+          fi
+          if [ -s /tmp/ikconfig ] && [ "$(wc -l < /tmp/ikconfig)" -gt 1000 ]; then
+            cp /tmp/ikconfig .config
+            echo ">>> 配置来源: IKCONFIG ($(wc -l < .config) 行)"
+          else
+            CFG=$(tar tzf "${BOOT_TGZ}" | grep -m1 -i 'config')
+            tar xzf "${BOOT_TGZ}" -O "$CFG" > .config 2>/dev/null
+            echo ">>> 配置来源: boot 包 ($(wc -l < .config) 行)"
+          fi
+          test "$(wc -l < .config)" -gt 1000 || { echo ".config 无效,把日志发我"; exit 1; }
           echo ">>> 关键结构选项:"
-          grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=' .config || true
-          aarch64-linux-gnu-nm /tmp/vmlinux | awk '$3 ~ /^__ksymtab_/ {
-              s=$3; sub(/^__ksymtab_/,"",s);
-              sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
-              sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
-              if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
-          }' | sort -u > Module.symvers
-          echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
+          grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=|CONFIG_KALLSYMS=' .config || true
+          # Module.symvers: 有 vmlinux 就从 ksymtab 提取, 否则降级 WARN 模式
+          if [ -s /tmp/vmlinux ] && head -c 4 /tmp/vmlinux | grep -q $'\x7fELF'; then
+            aarch64-linux-gnu-nm /tmp/vmlinux | awk '$3 ~ /^__ksymtab_/ {
+                s=$3; sub(/^__ksymtab_/,"",s);
+                sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
+                sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
+                if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
+            }' | sort -u > Module.symvers
+            echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
+          else
+            echo ">>> 无 vmlinux,驱动编译将使用 KBUILD_MODPOST_WARN"
+            echo "KMOD_WARN=1" >> $GITHUB_ENV
+          fi
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
-          echo "${{ env.KV }}" > include/config/kernel.release
-          sed -i "s/UTS_RELEASE \".*\"/UTS_RELEASE \"${{ env.KV }}\"/" include/generated/utsrelease.h
+          echo "${KV}" > include/config/kernel.release
+          sed -i "s/UTS_RELEASE \".*\"/UTS_RELEASE \"${KV}\"/" include/generated/utsrelease.h
           echo ">>> 内核构建树: $(cat include/config/kernel.release)"
 
       - name: 编译 AX900M 驱动(against flippy 内核)
@@ -137,61 +132,11 @@ jobs:
           echo ">>> vermagic 校验(必须等于 ${{ env.KV }}):"
           find aicsrc -name '*.ko' -exec modinfo {} \; | grep vermagic
 
-      - name: 准备中文语言包与切换工具(离线注入)
-        run: |
-          mkdir -p inject/opt/ipks inject/opt/bin inject/etc/uci-defaults
-          REL="${{ github.event.inputs.openwrt_version }}"
-          REL="${REL#v}"
-          REPO="https://downloads.openwrt.org/releases/${REL}/packages/aarch64_generic"
-          download_ipk() {
-            local sub="$1" pkg="$2" file
-            file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
-                   | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}')
-            case "$file" in
-              */*) ;;
-              *) file="${sub}/${file}" ;;
-            esac
-            if [ -n "$file" ]; then
-              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" \
-                && echo ">>> 已下载 ${pkg}" || echo ">>> 下载失败 ${pkg}"
-            else
-              echo ">>> 仓库里没找到 ${pkg}"
-            fi
-          }
-          download_ipk luci luci-i18n-base-zh-cn
-          download_ipk luci luci-i18n-firewall-zh-cn
-          download_ipk luci luci-i18n-mwan3-zh-cn
-          download_ipk packages usb-modeswitch
-          ls -la inject/opt/ipks/
-          # 从 ipk 里取出 usb_modeswitch 二进制备份到 /opt/bin
-          if [ -s inject/opt/ipks/usb-modeswitch.ipk ]; then
-            rm -rf /tmp/msw && mkdir -p /tmp/msw/data
-            tar xf inject/opt/ipks/usb-modeswitch.ipk -C /tmp/msw
-            tar xf /tmp/msw/data.tar.* -C /tmp/msw/data 2>/dev/null
-            BIN=$(find /tmp/msw/data -type f -name 'usb_modeswitch' | head -1)
-            if [ -n "$BIN" ]; then
-              cp "$BIN" inject/opt/bin/usb_modeswitch
-              chmod +x inject/opt/bin/usb_modeswitch
-              echo ">>> usb_modeswitch 二进制已提取"
-            fi
-          fi
-          # 首次开机: 强制恢复被重打包清掉的文件 + 设默认中文
-          cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
-          #!/bin/sh
-          opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
-          opkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null
-          for d in /usr/sbin /usr/bin /sbin /bin; do
-              cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null
-          done
-          uci set luci.main.lang='zh_cn' 2>/dev/null && uci commit luci 2>/dev/null
-          exit 0
-          EOF
-          chmod +x inject/etc/uci-defaults/99-zh-cn
       - name: 组装驱动注入包
         run: |
           mkdir -p inject/opt/aic8800 inject/lib/firmware \
                    inject/etc/usb_modeswitch.d inject/etc/custom_service \
-                   inject/etc/hotplug.d/usb
+                   inject/etc/hotplug.d/usb inject/etc/profile.d
           # 1. 驱动模块放 /opt/aic8800 —— 不能放 /lib/modules,
           #    ophub 打包替换内核时会清空 /lib/modules,放那里会被删掉
           find aicsrc -name '*.ko' -exec cp {} inject/opt/aic8800/ \;
@@ -242,8 +187,116 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/custom_service/start_service.sh
+          # 6. 覆盖 ophub 有语法错误的登录横幅脚本
+          printf '#!/bin/sh\n# 覆盖原脚本的 ash 语法报错\nexit 0\n' > inject/etc/profile.d/30-sysinfo.sh
+          chmod +x inject/etc/profile.d/30-sysinfo.sh
           echo ">>> 注入包:"
           find inject -type f | sort
+
+      - name: 准备中文语言包与切换工具(离线注入)
+        run: |
+          mkdir -p inject/opt/ipks inject/opt/bin inject/etc/uci-defaults
+          REL="${{ github.event.inputs.openwrt_version }}"
+          REL="${REL#v}"
+          REPO="https://downloads.openwrt.org/releases/${REL}/packages/aarch64_generic"
+          download_ipk() {
+            local sub="$1" pkg="$2" file
+            file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
+                   | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}')
+            case "$file" in
+              */*) ;;
+              *) file="${sub}/${file}" ;;
+            esac
+            if [ -n "$file" ]; then
+              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" \
+                && echo ">>> 已下载 ${pkg}" || echo ">>> 下载失败 ${pkg}"
+            else
+              echo ">>> 仓库里没找到 ${pkg}"
+            fi
+          }
+          download_ipk luci luci-i18n-base-zh-cn
+          download_ipk luci luci-i18n-firewall-zh-cn
+          download_ipk luci luci-i18n-mwan3-zh-cn
+          download_ipk packages usb-modeswitch
+          ls -la inject/opt/ipks/
+          # 从 ipk 里取出 usb_modeswitch 二进制备份到 /opt/bin
+          # (系统里的 usb_modeswitch 会被重打包清掉,/opt 安全)
+          if [ -s inject/opt/ipks/usb-modeswitch.ipk ]; then
+            rm -rf /tmp/msw && mkdir -p /tmp/msw/data
+            tar xf inject/opt/ipks/usb-modeswitch.ipk -C /tmp/msw
+            tar xf /tmp/msw/data.tar.* -C /tmp/msw/data 2>/dev/null
+            BIN=$(find /tmp/msw/data -type f -name 'usb_modeswitch' | head -1)
+            if [ -n "$BIN" ]; then
+              cp "$BIN" inject/opt/bin/usb_modeswitch
+              chmod +x inject/opt/bin/usb_modeswitch
+              echo ">>> usb_modeswitch 二进制已提取"
+            fi
+          fi
+          # 首次开机: 强制恢复被重打包清掉的文件 + 设默认中文
+          cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
+          #!/bin/sh
+          opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
+          opkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null
+          for d in /usr/sbin /usr/bin /sbin /bin; do
+              cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null
+          done
+          uci set luci.main.lang='zh_cn' 2>/dev/null && uci commit luci 2>/dev/null
+          exit 0
+          EOF
+          chmod +x inject/etc/uci-defaults/99-zh-cn
+
+      - name: 上传驱动模块包(免刷机热修用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax900m-modules
+          path: |
+            inject/opt/aic8800/
+            inject/opt/bin/
+          if-no-files-found: error
+
+      - name: 克隆 OpenWrt 源码
+        run: |
+          git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} \
+            https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成配置(无需仓库内 config 文件)
+        run: |
+          cd openwrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_armsr=y
+          CONFIG_TARGET_armsr_armv8=y
+          CONFIG_TARGET_ROOTFS_TARGZ=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_wpad-mbedtls=y
+          CONFIG_PACKAGE_iw=y
+          CONFIG_PACKAGE_iwinfo=y
+          CONFIG_PACKAGE_bluez-daemon=y
+          CONFIG_PACKAGE_bluez-utils=y
+          CONFIG_PACKAGE_usb-modeswitch=y
+          CONFIG_PACKAGE_usbutils=y
+          CONFIG_PACKAGE_mwan3=y
+          CONFIG_PACKAGE_luci-app-mwan3=y
+          CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
+          EOF
+          sed -i 's/^          //' .config
+          make defconfig
+
+      - name: 下载源码包
+        run: |
+          cd openwrt
+          make download -j$(nproc) || make download -j1 V=s
+
+      - name: 编译 OpenWrt rootfs
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+          ls -lh bin/targets/armsr/armv8/*rootfs.tar.gz
+          echo ">>> rootfs 内容检查(usb_modeswitch/中文/mwan3 是否真编进去了):"
+          tar tzf bin/targets/armsr/armv8/*rootfs.tar.gz | grep -E 'usb_modeswitch|zh-cn|mwan3' | sort
 
       - name: 升级 coreutils(ophub 脚本需要新版 cp 语法)
         run: |
@@ -264,15 +317,6 @@ jobs:
           openwrt_kernel: ${{ env.KV }}
           auto_kernel: false
           openwrt_files: inject
-
-      - name: 上传驱动模块包(免刷机热修用)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ax900m-modules
-          path: |
-            inject/opt/aic8800/
-            inject/opt/bin/
-          if-no-files-found: error
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
