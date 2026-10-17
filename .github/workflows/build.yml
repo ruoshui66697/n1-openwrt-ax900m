@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gettext git libncurses-dev libssl-dev \
             python3-setuptools rsync swig unzip zlib1g-dev file wget \
-            gcc-aarch64-linux-gnu bc libelf-dev kmod
+            gcc-aarch64-linux-gnu bc libelf-dev kmod bzip2
 
       - name: 查询 flippy 内核精确版本
         run: |
@@ -158,14 +158,42 @@ jobs:
           echo ">>> vermagic 校验(必须等于 ${{ env.KV }}):"
           find aicsrc -name '*.ko' -exec modinfo {} \; 2>/dev/null | grep vermagic || true
 
+      - name: 编译 usb_modeswitch 静态二进制
+        run: |
+          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
+          if [ -d libusb-src ]; then
+            cd libusb-src
+            (./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared \
+              --disable-udev --prefix=/tmp/usbroot >/dev/null 2>&1) \
+              || (./bootstrap.sh >/dev/null 2>&1 \
+                  && ./configure --host=aarch64-linux-gnu --enable-static --disable-shared \
+                     --disable-udev --prefix=/tmp/usbroot >/dev/null)
+            make -j$(nproc) >/dev/null 2>&1 || true
+            make install >/dev/null 2>&1 || true
+            cd ..
+          fi
+          curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
+          tar xjf /tmp/ums.tar.bz2 -C /tmp
+          cd /tmp/usb-modeswitch-2.6.1
+          make CC=aarch64-linux-gnu-gcc \
+               CFLAGS="-O2 -I/tmp/usbroot/include/libusb-1.0 -I/tmp/usbroot/include" \
+               LDFLAGS="-static -L/tmp/usbroot/lib" >/dev/null 2>&1 || \
+          make CC=aarch64-linux-gnu-gcc \
+               CFLAGS="-O2 -I/tmp/usbroot/include/libusb-1.0 -I/tmp/usbroot/include" \
+               LDFLAGS="-static -L/tmp/usbroot/lib"
+          ls -la usb_modeswitch || true
+          file usb_modeswitch || true
+          cp usb_modeswitch "$OLDPWD/" 2>/dev/null || true
+
       - name: 组装驱动注入包
         run: |
-          mkdir -p inject/opt/aic8800 inject/lib/firmware \
+          mkdir -p inject/opt/aic8800 inject/opt/bin inject/lib/firmware \
                    inject/etc/usb_modeswitch.d inject/etc/custom_service \
                    inject/etc/hotplug.d/usb inject/etc/profile.d
           find aicsrc -name '*.ko' -exec cp {} inject/opt/aic8800/ \; || true
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           cp -r aicsrc/fw/. inject/opt/aic8800/fw/ 2>/dev/null || true
+          cp usb_modeswitch inject/opt/bin/ 2>/dev/null || true
           find aicsrc -path '*modeswitch*' -type f ! -name '*.md' \
             -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
@@ -206,10 +234,10 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/custom_service/start_service.sh
-          printf '#!/bin/sh\n# 覆盖原脚本的 ash 语法报错\nexit 0\n' > inject/etc/profile.d/30-sysinfo.sh
-          chmod +x inject/etc/profile.d/30-sysinfo.sh
+          printf '#!/bin/sh\n# 覆盖原脚本的 ash 语法报错(只能纯注释,不能有exit,profile.d被登录shell内嵌执行,exit会杀掉shell)\n:\n' > inject/etc/profile.d/30-sysinfo.sh
           echo ">>> 注入包:"
           find inject -type f | sort || true
+          ls -la inject/opt/bin/ || true
 
       - name: 上传驱动模块包(免刷机热修用)
         uses: actions/upload-artifact@v4
@@ -220,10 +248,9 @@ jobs:
             inject/opt/bin/
           if-no-files-found: error
 
-      - name: 准备中文语言包与切换工具(离线注入)
+      - name: 准备中文语言包(离线注入)
         run: |
-          sudo apt-get install -y libarchive-tools
-          mkdir -p inject/opt/ipks inject/opt/bin inject/etc/uci-defaults
+          mkdir -p inject/opt/ipks inject/etc/uci-defaults
           REL="${{ github.event.inputs.openwrt_version }}"
           REL="${REL#v}"
           REPO="https://downloads.openwrt.org/releases/${REL}/packages/aarch64_generic"
@@ -245,38 +272,7 @@ jobs:
           download_ipk luci luci-i18n-base-zh-cn
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
-          download_ipk packages usb-modeswitch
           ls -la inject/opt/ipks/ || true
-          if [ -s inject/opt/ipks/usb-modeswitch.ipk ]; then
-            rm -rf /tmp/msw && mkdir -p /tmp/msw/outer /tmp/msw/data
-            IPK="$PWD/inject/opt/ipks/usb-modeswitch.ipk"
-            echo ">>> ipk 文件类型诊断:"
-            file "$IPK" || true
-            od -A x -t x1z "$IPK" 2>/dev/null | head -2 || true
-            bsdtar xf "$IPK" -C /tmp/msw/outer 2>/dev/null \
-              || tar xf "$IPK" -C /tmp/msw/outer 2>/dev/null \
-              || zstd -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
-              || zcat "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
-              || xz -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
-              || (cd /tmp/msw/outer && ar x "$IPK" 2>/dev/null) \
-              || true
-            DATA=$(find /tmp/msw/outer -maxdepth 1 -name 'data.tar.*' | head -1 || true)
-            if [ -n "$DATA" ]; then
-              bsdtar xf "$DATA" -C /tmp/msw/data 2>/dev/null \
-                || tar xf "$DATA" -C /tmp/msw/data 2>/dev/null \
-                || zstd -dc "$DATA" 2>/dev/null | tar x -C /tmp/msw/data 2>/dev/null \
-                || zcat "$DATA" 2>/dev/null | tar x -C /tmp/msw/data 2>/dev/null \
-                || true
-            fi
-            BIN=$(find /tmp/msw/data -type f -name 'usb_modeswitch' | head -1 || true)
-            if [ -n "$BIN" ]; then
-              cp "$BIN" inject/opt/bin/usb_modeswitch
-              chmod +x inject/opt/bin/usb_modeswitch
-              echo ">>> usb_modeswitch 二进制已提取"
-            else
-              echo ">>> 未能从 ipk 提取 usb_modeswitch(把'文件类型诊断'输出发我)"
-            fi
-          fi
           cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
           #!/bin/sh
           opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
