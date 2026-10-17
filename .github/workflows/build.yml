@@ -38,7 +38,6 @@ jobs:
           test -n "$KV" || { echo "查询 flippy 内核版本失败"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
           echo ">>> flippy 内核: 6.12.${KV}"
-          # 下载官方内核包,只为取里面的 .config(构建配置必须与之一致)
           curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/6.12.${KV}.tar.gz" -o /tmp/k.tar.gz
           tar xzf /tmp/k.tar.gz -C /tmp
           BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
@@ -57,7 +56,6 @@ jobs:
           rm -rf ksrc-src && git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc-src
           cd ksrc-src
           KV="${{ env.KV }}"
-          # 源码锁定到与发布版本一致的提交
           for c in $(git rev-list -n 5 HEAD); do
             V=$(git show "$c:Makefile" 2>/dev/null | awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' | sed 's/\.$//')
             if [ "$V" = "$KV" ]; then
@@ -66,12 +64,10 @@ jobs:
             fi
           done
           echo ">>> 源码版本: $(awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' Makefile | sed 's/\.$//') (目标 $KV)"
-          # 放入官方配置,去掉 -ophub 后缀(保证版本号与 ophub 匹配规则兼容)
           rm -f .config
           mv ../ksrc/.config .
           scripts/config --set-str LOCALVERSION ""
           cd ..
-          # AX900M 驱动源码
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
           echo ">>> 驱动固件:"; ls aicsrc/fw/ || true
@@ -83,14 +79,13 @@ jobs:
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
           make ARCH=arm64 INSTALL_MOD_PATH=/tmp/kmod modules_install
-          # AX900M 驱动与内核同源编译,混入模块树
-          mkdir -p /tmp/kmod/lib/modules/${KV}/extra/aic8800
+          mkdir -p /tmp/kmod/lib/modules/${KV}/kernel/drivers/aic8800
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules
-          find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KV}/extra/aic8800/ \;
+          find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KV}/kernel/drivers/aic8800/ \;
           depmod -b /tmp/kmod ${KV}
           echo ">>> 内核: $(make -s kernelversion)"
           echo ">>> AX900M 驱动已编入模块树:"
-          ls -la /tmp/kmod/lib/modules/${KV}/extra/aic8800/
+          ls -la /tmp/kmod/lib/modules/${KV}/kernel/drivers/aic8800/
 
       - name: 编译 usb_modeswitch 静态二进制
         run: |
@@ -131,27 +126,25 @@ jobs:
           cp arch/arm64/boot/Image /tmp/rel/boot/vmlinuz-${KV}
           cp .config /tmp/rel/boot/config-${KV}
           cp System.map /tmp/rel/boot/System.map-${KV}
-          # 最小 initramfs(空 cpio,内核无 /init 时自动回退 root= 挂载)
           rm -rf /tmp/initrd && mkdir -p /tmp/initrd
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz \
             /tmp/rel/boot/uInitrd-${KV} 2>/dev/null || cp /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
-          # amlogic 全部 dtb(ophub 要求 dtb/amlogic 下至少 2 个文件)
           cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
           cd /tmp/rel
           tar czf boot-${KV}.tar.gz -C boot .
           tar czf dtb-amlogic-${KV}.tar.gz -C dtb .
           tar czf modules-${KV}.tar.gz -C /tmp/kmod/lib/modules ${KV}
           ls -lh *.tar.gz
-          mkdir -p wrap && mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/
-          cd wrap && sha256sum *.tar.gz > sha256sums
-          tar czf ${KV}.tar.gz boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz sha256sums
+          mkdir -p wrap/${KV}
+          mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/${KV}/
+          cd wrap/${KV} && sha256sum *.tar.gz > sha256sums
+          cd .. && tar czf ${KV}.tar.gz ${KV}
           echo ">>> 发布内核 Release (kernel_stable/${KV}.tar.gz)"
           gh release delete kernel_stable --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create kernel_stable ${KV}.tar.gz \
             --repo ${{ github.repository }} \
             -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
-          # 释放磁盘空间
           rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src"
           df -h "$GITHUB_WORKSPACE" | tail -1
 
@@ -196,7 +189,12 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/custom_service/start_service.sh
-          printf '#!/bin/sh\n# 覆盖原脚本的 ash 语法报错(只能纯注释,不能有exit,profile.d被登录shell内嵌执行,exit会杀掉shell)\n:\n' > inject/etc/profile.d/30-sysinfo.sh
+          cat > inject/etc/profile.d/30-sysinfo.sh <<'EOF'
+          #!/bin/sh
+          echo "==================================="
+          echo "  CPU 温度: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))°C"
+          echo "==================================="
+          EOF
           echo ">>> 注入包:"
           find inject -type f | sort || true
           ls -la inject/opt/bin/ || true
@@ -315,3 +313,19 @@ jobs:
           name: N1-OpenWrt-AX900M
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
+
+      - name: 构建结果推送到微信(Server酱)
+        if: always()
+        run: |
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ job.status }}" = "success" ]; then
+            TITLE="✅ N1固件构建成功"
+            CONTENT="固件已编译完成,去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。${RUN_URL}"
+          else
+            TITLE="❌ N1固件构建失败"
+            CONTENT="请到 Actions 查看失败步骤日志(Ctrl+F 搜 Error)。${RUN_URL}"
+          fi
+          curl -sS -X POST "https://sctapi.ftqq.com/${{ secrets.SCTKEY }}.send" \
+            --data-urlencode "title=${TITLE}" \
+            --data-urlencode "desp=${CONTENT}" \
+            || echo ">>> Server酱推送失败(不影响构建)"
