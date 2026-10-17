@@ -89,25 +89,31 @@ jobs:
           tar xzf /tmp/k.tar.gz -C /tmp
           BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1)
           test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
-          CFG=$(tar tzf "${BOOT_TGZ}" | grep -m1 -i 'config')
-          test -n "$CFG" || { echo "boot 包中没有 config,把日志发我"; exit 1; }
-          tar xzf "${BOOT_TGZ}" -O "$CFG" > .config 2>/dev/null
-          # 尝试从内核镜像提取导出符号表生成 Module.symvers
           mkdir -p /tmp/boot && tar xzf "${BOOT_TGZ}" -C /tmp/boot 2>/dev/null
           zimg=$(find /tmp/boot \( -name 'zImage*' -o -name 'vmlinuz*' \) 2>/dev/null | head -1)
-          echo ">>> 内核镜像: ${zimg}"
-          if [ -n "$zimg" ] && scripts/extract-vmlinux "$zimg" > /tmp/vmlinux 2>/dev/null && [ -s /tmp/vmlinux ]; then
-            aarch64-linux-gnu-nm /tmp/vmlinux | awk '$3 ~ /^__ksymtab_/ {
-                s=$3; sub(/^__ksymtab_/,"",s);
-                sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
-                sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
-                if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
-            }' | sort -u > Module.symvers
-            echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
+          test -n "$zimg" || { echo "boot 包中没有 zImage,把日志发我"; exit 1; }
+          scripts/extract-vmlinux "$zimg" > /tmp/vmlinux
+          test -s /tmp/vmlinux || { echo "内核镜像解包失败,把日志发我"; exit 1; }
+          # 关键: 用内核镜像内置的 IKCONFIG(运行内核的绝对真实配置)
+          if scripts/extract-ikconfig /tmp/vmlinux > /tmp/ikconfig 2>/dev/null \
+             && [ "$(wc -l < /tmp/ikconfig)" -gt 1000 ]; then
+            cp /tmp/ikconfig .config
+            echo ">>> 使用 IKCONFIG ($(wc -l < .config) 行)"
           else
-            echo ">>> 内核镜像解包失败,改用 KBUILD_MODPOST_WARN 模式"
-            echo "KMOD_WARN=1" >> $GITHUB_ENV
+            CFG=$(tar tzf "${BOOT_TGZ}" | grep -m1 -i '^boot/config')
+            tar xzf "${BOOT_TGZ}" -O "$CFG" > .config
+            echo ">>> 使用 boot 包 config ($(wc -l < .config) 行)"
           fi
+          test "$(wc -l < .config)" -gt 1000 || { echo ".config 不完整,把日志发我"; exit 1; }
+          echo ">>> 关键结构选项:"
+          grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=' .config || true
+          aarch64-linux-gnu-nm /tmp/vmlinux | awk '$3 ~ /^__ksymtab_/ {
+              s=$3; sub(/^__ksymtab_/,"",s);
+              sub(/^gpl_unused_/,"",s); sub(/^gpl_future_/,"",s);
+              sub(/^unused_/,"",s); sub(/^gpl_/,"",s);
+              if (s != "strings" && s != "") print "0x00000000\t" s "\tvmlinux"
+          }' | sort -u > Module.symvers
+          echo ">>> 内核导出符号数: $(wc -l < Module.symvers)"
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
           echo "${{ env.KV }}" > include/config/kernel.release
@@ -131,42 +137,56 @@ jobs:
           echo ">>> vermagic 校验(必须等于 ${{ env.KV }}):"
           find aicsrc -name '*.ko' -exec modinfo {} \; | grep vermagic
 
-      - name: 准备中文语言包与模式切换工具(离线注入)
+      - name: 准备中文语言包与切换工具(离线注入)
         run: |
-          mkdir -p inject/opt/ipks inject/etc/uci-defaults
+          mkdir -p inject/opt/ipks inject/opt/bin inject/etc/uci-defaults
           REL="${{ github.event.inputs.openwrt_version }}"
           REL="${REL#v}"
           REPO="https://downloads.openwrt.org/releases/${REL}/packages/aarch64_generic"
-          # 下载 ipk 到固件,首次开机离线安装(不依赖 CONFIG 内置,不依赖盒子联网)
           download_ipk() {
-            local sub="$1" pkg="$2"
-            local file
+            local sub="$1" pkg="$2" file
             file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
-                   | grep "^Filename: .*${pkg}_" | head -1 | awk '{print $2}')
+                   | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}')
             case "$file" in
               */*) ;;
               *) file="${sub}/${file}" ;;
             esac
             if [ -n "$file" ]; then
-              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/$(basename "${file}")" \
-                && echo ">>> 已下载 ${pkg}"
+              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" \
+                && echo ">>> 已下载 ${pkg}" || echo ">>> 下载失败 ${pkg}"
             else
-              echo ">>> 仓库里没找到 ${pkg}(忽略)"
+              echo ">>> 仓库里没找到 ${pkg}"
             fi
           }
           download_ipk luci luci-i18n-base-zh-cn
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
           download_ipk packages usb-modeswitch
-          # 首次开机:离线装语言包+切换工具,并设置默认中文
+          ls -la inject/opt/ipks/
+          # 从 ipk 里取出 usb_modeswitch 二进制备份到 /opt/bin
+          if [ -s inject/opt/ipks/usb-modeswitch.ipk ]; then
+            rm -rf /tmp/msw && mkdir -p /tmp/msw/data
+            tar xf inject/opt/ipks/usb-modeswitch.ipk -C /tmp/msw
+            tar xf /tmp/msw/data.tar.* -C /tmp/msw/data 2>/dev/null
+            BIN=$(find /tmp/msw/data -type f -name 'usb_modeswitch' | head -1)
+            if [ -n "$BIN" ]; then
+              cp "$BIN" inject/opt/bin/usb_modeswitch
+              chmod +x inject/opt/bin/usb_modeswitch
+              echo ">>> usb_modeswitch 二进制已提取"
+            fi
+          fi
+          # 首次开机: 强制恢复被重打包清掉的文件 + 设默认中文
           cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
           #!/bin/sh
-          opkg install /opt/ipks/luci-i18n-*.ipk /opt/ipks/usb-modeswitch_*.ipk 2>/dev/null
+          opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
+          opkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null
+          for d in /usr/sbin /usr/bin /sbin /bin; do
+              cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null
+          done
           uci set luci.main.lang='zh_cn' 2>/dev/null && uci commit luci 2>/dev/null
           exit 0
           EOF
           chmod +x inject/etc/uci-defaults/99-zh-cn
-
       - name: 组装驱动注入包
         run: |
           mkdir -p inject/opt/aic8800 inject/lib/firmware \
@@ -244,6 +264,15 @@ jobs:
           openwrt_kernel: ${{ env.KV }}
           auto_kernel: false
           openwrt_files: inject
+
+      - name: 上传驱动模块包(免刷机热修用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax900m-modules
+          path: |
+            inject/opt/aic8800/
+            inject/opt/bin/
+          if-no-files-found: error
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
