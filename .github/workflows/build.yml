@@ -42,7 +42,6 @@ jobs:
           git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc
           cd ksrc
           KV="${{ env.KV }}"
-          # 源码尽量锁定到与发布内核一致的版本
           for c in $(git rev-list -n 5 HEAD); do
             V=$(git show "$c:Makefile" 2>/dev/null | awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' | sed 's/\.$//')
             if [ "$V" = "$KV" ]; then
@@ -57,33 +56,45 @@ jobs:
           test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
           mkdir -p /tmp/boot && tar xzf "${BOOT_TGZ}" -C /tmp/boot 2>/dev/null
           echo ">>> boot 包内容:"
-          find /tmp/boot -type f | head -20
-          zimg=$(find /tmp/boot -type f \( -name 'zImage*' -o -name 'vmlinuz*' -o -name 'Image*' -o -name 'vmlinux*' \) 2>/dev/null | head -1)
+          find /tmp/boot -type f
+          zimg=$(find /tmp/boot -type f \( -name 'zImage*' -o -name 'vmlinuz*' -o -name 'Image*' -o -name 'vmlinux*' -o -name 'uImage*' \) 2>/dev/null | head -1)
           test -n "$zimg" || { echo "boot 包里没有内核镜像,把日志发我"; exit 1; }
           echo ">>> 内核镜像: $zimg ($(stat -c%s "$zimg") 字节)"
-          # 多策略解包: 裸ELF / gzip / zstd / lz4 / bzip2
+          echo ">>> 镜像前 64 字节:"
+          od -A x -t x1z "$zimg" | head -4
+          # ===== v4 解包: 裸ELF / uImage头跳过 / 任意偏移ELF / 多种压缩 =====
           rm -f /tmp/vmlinux
-          if head -c 4 "$zimg" | grep -q $'\x7fELF'; then
-            cp "$zimg" /tmp/vmlinux
-          else
-            try_magic() {
-              local m="$1" cmd="$2" off
-              for off in $(LC_ALL=C grep -abo "$m" "$zimg" 2>/dev/null | head -3 | cut -d: -f1); do
-                dd if="$zimg" bs=1 skip="$off" 2>/dev/null | $cmd > /tmp/vmlinux 2>/dev/null
+          extract_vmlinux() {
+            local f="$1" off o m cmd pair
+            head -c 4 "$f" | grep -q $'\x7fELF' && { cat "$f" > /tmp/vmlinux; return 0; }
+            if head -c 4 "$f" | grep -q "$(printf '\x27\x05\x19\x56')"; then
+              echo ">>> 检测到 uImage 头,跳过 64 字节"
+              dd if="$f" of=/tmp/inner.$$ ibs=1 skip=64 2>/dev/null
+              if extract_vmlinux /tmp/inner.$$; then rm -f /tmp/inner.$$; return 0; fi
+              rm -f /tmp/inner.$$
+            fi
+            off=$(LC_ALL=C grep -abo $'\x7fELF' "$f" 2>/dev/null | head -1 | cut -d: -f1)
+            if [ -n "$off" ]; then
+              dd if="$f" bs=1 skip="$off" 2>/dev/null | cat > /tmp/vmlinux 2>/dev/null
+              head -c 4 /tmp/vmlinux | grep -q $'\x7fELF' && return 0
+            fi
+            for pair in "$(printf '\x1f\x8b\x08')|zcat" \
+                        "$(printf '\x28\xb5\x2f\xfd')|zstd -dc" \
+                        "$(printf '\x02\x21\x4c\x18')|lz4 -dc" \
+                        "$(printf '\x42\x5a\x68')|bzip2 -dc"; do
+              m="${pair%%|*}"; cmd="${pair##*|}"
+              for o in $(LC_ALL=C grep -abo "$m" "$f" 2>/dev/null | head -3 | cut -d: -f1); do
+                dd if="$f" bs=1 skip="$o" 2>/dev/null | $cmd > /tmp/vmlinux 2>/dev/null
                 head -c 4 /tmp/vmlinux 2>/dev/null | grep -q $'\x7fELF' && return 0
               done
-              return 1
-            }
-            try_magic "$(printf '\x1f\x8b\x08')" "zcat" \
-            || try_magic "$(printf '\x28\xb5\x2f\xfd')" "zstd -dc" \
-            || try_magic "$(printf '\x02\x21\x4c\x18')" "lz4 -dc" \
-            || try_magic "$(printf '\x42\x5a\x68')" "bzip2 -dc" \
-            || echo ">>> 未能解包内核镜像(降级处理,日志发我)"
-          fi
-          # 配置: 优先 IKCONFIG(内核里嵌的绝对真实配置)
-          if [ -s /tmp/vmlinux ] && head -c 4 /tmp/vmlinux | grep -q $'\x7fELF'; then
+            done
+            return 1
+          }
+          if extract_vmlinux "$zimg" && [ -s /tmp/vmlinux ]; then
             echo ">>> vmlinux 提取成功 ($(stat -c%s /tmp/vmlinux) 字节)"
             scripts/extract-ikconfig /tmp/vmlinux > /tmp/ikconfig 2>/dev/null || true
+          else
+            echo ">>> 未能解包内核镜像(降级处理,把上面'镜像前64字节'发我)"
           fi
           if [ -s /tmp/ikconfig ] && [ "$(wc -l < /tmp/ikconfig)" -gt 1000 ]; then
             cp /tmp/ikconfig .config
@@ -96,7 +107,6 @@ jobs:
           test "$(wc -l < .config)" -gt 1000 || { echo ".config 无效,把日志发我"; exit 1; }
           echo ">>> 关键结构选项:"
           grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=|CONFIG_KALLSYMS=' .config || true
-          # Module.symvers: 有 vmlinux 就从 ksymtab 提取, 否则降级 WARN 模式
           if [ -s /tmp/vmlinux ] && head -c 4 /tmp/vmlinux | grep -q $'\x7fELF'; then
             aarch64-linux-gnu-nm /tmp/vmlinux | awk '$3 ~ /^__ksymtab_/ {
                 s=$3; sub(/^__ksymtab_/,"",s);
@@ -193,6 +203,15 @@ jobs:
           echo ">>> 注入包:"
           find inject -type f | sort
 
+      - name: 上传驱动模块包(免刷机热修用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax900m-modules
+          path: |
+            inject/opt/aic8800/
+            inject/opt/bin/
+          if-no-files-found: error
+
       - name: 准备中文语言包与切换工具(离线注入)
         run: |
           mkdir -p inject/opt/ipks inject/opt/bin inject/etc/uci-defaults
@@ -224,7 +243,6 @@ jobs:
           if [ -s inject/opt/ipks/usb-modeswitch.ipk ]; then
             rm -rf /tmp/msw && mkdir -p /tmp/msw/outer /tmp/msw/data
             IPK="$PWD/inject/opt/ipks/usb-modeswitch.ipk"
-            # ipk 外层可能是多种压缩的 tar,逐个尝试
             tar xf "$IPK" -C /tmp/msw/outer 2>/dev/null \
               || zstd -dc "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
               || zcat "$IPK" 2>/dev/null | tar x -C /tmp/msw/outer 2>/dev/null \
@@ -256,15 +274,6 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/uci-defaults/99-zh-cn
-
-      - name: 上传驱动模块包(免刷机热修用)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ax900m-modules
-          path: |
-            inject/opt/aic8800/
-            inject/opt/bin/
-          if-no-files-found: error
 
       - name: 克隆 OpenWrt 源码
         run: |
