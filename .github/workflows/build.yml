@@ -76,7 +76,10 @@ jobs:
         run: |
           cd ksrc-src
           KV="${{ env.KV }}"
+          grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_before 2>/dev/null || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_after 2>/dev/null || true
+          echo ">>> olddefconfig 配置差异:"; diff /tmp/cfg_before /tmp/cfg_after || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
           make ARCH=arm64 INSTALL_MOD_PATH=/tmp/kmod modules_install
           mkdir -p /tmp/kmod/lib/modules/${KV}/kernel/drivers/aic8800
@@ -115,6 +118,18 @@ jobs:
           file usb_modeswitch || true
           cp usb_modeswitch "$OLDPWD/" 2>/dev/null || true
 
+      - name: 编译 busybox 静态二进制(initramfs 挂载根分区用)
+        run: |
+          curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
+          cd /tmp/busybox-1.36.1
+          make defconfig
+          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          sed -i 's/^CONFIG_STATIC=n/CONFIG_STATIC=y/' .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+          file busybox || true
+          ls -la busybox || true
+          cp busybox "$OLDPWD/" 2>/dev/null || true
+
       - name: 打包内核并发布 Release(ophub 格式)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -126,7 +141,40 @@ jobs:
           cp arch/arm64/boot/Image /tmp/rel/boot/vmlinuz-${KV}
           cp .config /tmp/rel/boot/config-${KV}
           cp System.map /tmp/rel/boot/System.map-${KV}
-          rm -rf /tmp/initrd && mkdir -p /tmp/initrd
+          rm -rf /tmp/initrd && mkdir -p /tmp/initrd/bin /tmp/initrd/proc /tmp/initrd/sys /tmp/initrd/dev /tmp/initrd/mnt
+          cp "$GITHUB_WORKSPACE/busybox" /tmp/initrd/bin/busybox
+          for app in sh mount umount switch_root cat echo sleep; do
+            ln -sf busybox /tmp/initrd/bin/$app
+          done
+          cat > /tmp/initrd/init <<'EOF'
+          #!/bin/sh
+          PATH=/bin
+          mount -t devtmpfs devtmpfs /dev 2>/dev/null
+          mount -t proc proc /proc 2>/dev/null
+          mount -t sysfs sysfs /sys 2>/dev/null
+          echo "[initramfs] 等待根分区就绪 ..."
+          sleep 3
+          ROOT=""
+          for p in mmcblk2p2 mmcblk2p3; do
+              for opt in "subvol=ROOTFS" "subvol=ROOTFS1" "subvol=ROOTFS2" ""; do
+                  if [ -n "$opt" ]; then
+                      mount -t btrfs -o "$opt" /dev/$p /mnt 2>/dev/null && { ROOT=$p; break; }
+                  else
+                      mount -t btrfs /dev/$p /mnt 2>/dev/null && { ROOT=$p; break; }
+                      mount -t ext4 /dev/$p /mnt 2>/dev/null && { ROOT=$p; break; }
+                  fi
+              done
+              [ -n "$ROOT" ] && break
+          done
+          if [ -n "$ROOT" ] && [ -x /mnt/sbin/init ]; then
+              echo "[initramfs] 根分区: /dev/$ROOT, 切换启动"
+              umount /proc /sys 2>/dev/null
+              exec switch_root /mnt /sbin/init
+          fi
+          echo "[initramfs] 未找到根分区, 进入应急 shell"
+          exec /bin/sh
+          EOF
+          chmod +x /tmp/initrd/init
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz \
             /tmp/rel/boot/uInitrd-${KV} 2>/dev/null || cp /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
