@@ -66,7 +66,7 @@ jobs:
           echo ">>> 源码版本: $(awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' Makefile | sed 's/\.$//') (目标 $KV)"
           rm -f .config
           mv ../ksrc/.config .
-          scripts/config --set-str LOCALVERSION ""
+          scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
           cd ..
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
@@ -75,20 +75,21 @@ jobs:
       - name: 完整编译内核(内核+dtb+模块+AX900M驱动,同一构建树)
         run: |
           cd ksrc-src
-          KV="${{ env.KV }}"
+          KREL=$(make -s ARCH=arm64 kernelrelease)
+          echo ">>> 内核真实版本号: ${KREL}"
           grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_before 2>/dev/null || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_after 2>/dev/null || true
           echo ">>> olddefconfig 配置差异:"; diff /tmp/cfg_before /tmp/cfg_after || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
           make ARCH=arm64 INSTALL_MOD_PATH=/tmp/kmod modules_install
-          mkdir -p /tmp/kmod/lib/modules/${KV}/kernel/drivers/aic8800
+          mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules
-          find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KV}/kernel/drivers/aic8800/ \;
-          depmod -b /tmp/kmod ${KV}
-          echo ">>> 内核: $(make -s kernelversion)"
+          find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
+          depmod -b /tmp/kmod ${KREL}
+          echo ">>> 内核: ${KREL}"
           echo ">>> AX900M 驱动已编入模块树:"
-          ls -la /tmp/kmod/lib/modules/${KV}/kernel/drivers/aic8800/
+          ls -la /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/
 
       - name: 编译 usb_modeswitch 静态二进制
         run: |
@@ -155,17 +156,26 @@ jobs:
           echo "[initramfs] 等待根分区就绪 ..."
           sleep 3
           ROOT=""
-          for p in mmcblk2p2 mmcblk2p3; do
+          try_mount() {
+              p="$1"
               for opt in "subvol=ROOTFS" "subvol=ROOTFS1" "subvol=ROOTFS2" ""; do
                   if [ -n "$opt" ]; then
-                      mount -t btrfs -o "$opt" /dev/$p /mnt 2>/dev/null && { ROOT=$p; break; }
+                      mount -t btrfs -o "$opt" /dev/$p /mnt 2>/dev/null && return 0
                   else
-                      mount -t btrfs /dev/$p /mnt 2>/dev/null && { ROOT=$p; break; }
-                      mount -t ext4 /dev/$p /mnt 2>/dev/null && { ROOT=$p; break; }
+                      mount -t btrfs /dev/$p /mnt 2>/dev/null && return 0
+                      mount -t ext4 /dev/$p /mnt 2>/dev/null && return 0
                   fi
               done
-              [ -n "$ROOT" ] && break
-          done
+              return 1
+          }
+          try_all() {
+              for p in sda2 sdb2 sdc2 sdd2 mmcblk2p2 mmcblk2p3; do
+                  [ -b /dev/$p ] || continue
+                  if try_mount $p; then ROOT=$p; return 0; fi
+              done
+              return 1
+          }
+          try_all || { sleep 5; echo "[initramfs] 重试(USB枚举可能较慢)..."; try_all; }
           if [ -n "$ROOT" ] && [ -x /mnt/sbin/init ]; then
               echo "[initramfs] 根分区: /dev/$ROOT, 切换启动"
               umount /proc /sys 2>/dev/null
@@ -182,7 +192,7 @@ jobs:
           cd /tmp/rel
           tar czf boot-${KV}.tar.gz -C boot .
           tar czf dtb-amlogic-${KV}.tar.gz -C dtb .
-          tar czf modules-${KV}.tar.gz -C /tmp/kmod/lib/modules ${KV}
+          tar czf modules-${KV}.tar.gz -C /tmp/kmod/lib/modules ${KREL:-${KV}}
           ls -lh *.tar.gz
           mkdir -p wrap/${KV}
           mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/${KV}/
