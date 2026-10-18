@@ -389,10 +389,10 @@ jobs:
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ "${{ job.status }}" = "success" ]; then
-            TITLE="[N1固件] 构建成功"
+            TITLE="[openWrt N1] 构建成功"
             CONTENT="固件已编译完成,去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
           else
-            TITLE="[N1固件] 构建失败"
+            TITLE="[openWrt N1] 构建失败"
             CONTENT="请到 Actions 查看失败步骤日志(Ctrl+F 搜 Error)。"
           fi
           RESP=$(curl -sS -X POST \
