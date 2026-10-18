@@ -67,6 +67,7 @@ jobs:
           rm -f .config
           mv ../ksrc/.config .
           scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
+          grep -E 'CONFIG_LOCALVERSION' .config || true
           cd ..
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
@@ -193,10 +194,13 @@ jobs:
             /tmp/rel/boot/uInitrd-${KV} 2>/dev/null || cp /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
           cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
           cd /tmp/rel
-          tar czf boot-${KV}.tar.gz -C boot .
-          tar czf dtb-amlogic-${KV}.tar.gz -C dtb .
-          tar czf modules-${KV}.tar.gz -C /tmp/kmod/lib/modules ${{ env.KREL }}
+          tar czf boot-${KV}.tar.gz --owner=0 --group=0 -C boot .
+          tar czf dtb-amlogic-${KV}.tar.gz --owner=0 --group=0 -C dtb .
+          tar czf modules-${KV}.tar.gz --owner=0 --group=0 -C /tmp/kmod/lib/modules ${{ env.KREL }}
           ls -lh *.tar.gz
+          rm -rf /tmp/kv && mkdir -p /tmp/kv && tar xzf modules-${KV}.tar.gz -C /tmp/kv
+          echo ">>> modules 包顶层目录: $(ls /tmp/kv)"
+          test "$(ls /tmp/kv | head -1)" = "${KV}" || { echo ">>> 模块目录名与 ${KV} 不一致!"; ls /tmp/kv; exit 1; }
           mkdir -p wrap/${KV}
           mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/${KV}/
           cd wrap/${KV} && sha256sum *.tar.gz > sha256sums
@@ -375,18 +379,19 @@ jobs:
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
 
-      - name: 构建结果推送到微信(Server酱)
+      - name: 构建结果推送到钉钉
         if: always()
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ "${{ job.status }}" = "success" ]; then
-            TITLE="✅ N1固件构建成功"
-            CONTENT="固件已编译完成,去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。${RUN_URL}"
+            TITLE="[N1固件] 构建成功"
+            CONTENT="固件已编译完成,去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
           else
-            TITLE="❌ N1固件构建失败"
-            CONTENT="请到 Actions 查看失败步骤日志(Ctrl+F 搜 Error)。${RUN_URL}"
+            TITLE="[N1固件] 构建失败"
+            CONTENT="请到 Actions 查看失败步骤日志(Ctrl+F 搜 Error)。"
           fi
-          curl -sS -X POST "https://sctapi.ftqq.com/${{ secrets.SCTKEY }}.send" \
-            --data-urlencode "title=${TITLE}" \
-            --data-urlencode "desp=${CONTENT}" \
-            || echo ">>> Server酱推送失败(不影响构建)"
+          curl -sS -X POST \
+            "https://oapi.dingtalk.com/robot/send?access_token=${{ secrets.DINGTALK_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${TITLE} ${CONTENT} ${RUN_URL}\"}}" \
+            || echo ">>> 钉钉推送失败(不影响构建)"
