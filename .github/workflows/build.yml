@@ -34,6 +34,7 @@ jobs:
       - name: 查询 flippy 内核版本并获取内核配置
         run: |
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
+
                | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1 || true)
           test -n "$KV" || { echo "查询 flippy 内核版本失败"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
@@ -88,14 +89,29 @@ jobs:
           KREL=$(make -s ARCH=arm64 kernelrelease)
           echo "KREL=${KREL}" >> $GITHUB_ENV
           echo ">>> 内核真实版本号: ${KREL}"
+          
+          # [新增] 校验抓取版本号与实际编译版本号是否一致，防止后续打包目录错乱
+          [ "$KREL" = "$KV" ] || { echo "❌ 版本不匹配: KREL=$KREL != KV=$KV"; exit 1; }
+          
           grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_after 2>/dev/null || true
           echo ">>> olddefconfig 配置差异:"; diff /tmp/cfg_before /tmp/cfg_after || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs
-          make ARCH=arm64 INSTALL_MOD_PATH=/tmp/kmod modules_install
+          
+          # [修复] 交叉编译必须禁用 Makefile 内置的 depmod (DEPMOD=/bin/true)
+          # 否则 x86 宿主机的 depmod 会因无法解析 ARM64 模块而报错退出
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               INSTALL_MOD_PATH=/tmp/kmod \
+               INSTALL_MOD_STRIP=1 \
+               DEPMOD=/bin/true \
+               modules_install
+          
           mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
+          
+          # 所有模块拷贝完毕后，手动运行 depmod 生成依赖关系
           depmod -b /tmp/kmod ${KREL}
+          
           echo ">>> 内核: ${KREL}"
           echo ">>> AX900M 驱动已编入模块树:"
           ls -la /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/
@@ -154,7 +170,7 @@ jobs:
           rm -rf /tmp/initrd && mkdir -p /tmp/initrd/bin /tmp/initrd/proc /tmp/initrd/sys /tmp/initrd/dev /tmp/initrd/mnt
           cp "$GITHUB_WORKSPACE/busybox" /tmp/initrd/bin/busybox
           for app in sh mount umount switch_root cat echo sleep; do
-            ln -sf busybox /tmp/initrd/bin/$app
+              ln -sf busybox /tmp/initrd/bin/$app
           done
           cat > /tmp/initrd/init <<'EOF'
           #!/bin/sh
@@ -286,6 +302,7 @@ jobs:
           download_ipk() {
             local sub="$1" pkg="$2" file
             file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
+
                    | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}' || true)
             case "$file" in
               */*) ;;
@@ -389,10 +406,10 @@ jobs:
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ "${{ job.status }}" = "success" ]; then
-            TITLE="[openWrt N1] 构建成功"
+            TITLE="[openwrt N1] 构建成功"
             CONTENT="固件已编译完成,去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
           else
-            TITLE="[openWrt N1] 构建失败"
+            TITLE="[openwrt N1] 构建失败"
             CONTENT="请到 Actions 查看失败步骤日志(Ctrl+F 搜 Error)。"
           fi
           RESP=$(curl -sS -X POST \
