@@ -68,7 +68,9 @@ jobs:
           mv ../ksrc/.config .
           scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
           grep -E 'CONFIG_LOCALVERSION' .config || true
-          # 封印 git 脏树标记: 空 .scmversion 让 setlocalversion 直接跳过, 版本号保证为 ${KV}
+          # 彻底封印版本号尾巴: 覆盖 setlocalversion 脚本使其直接退出,
+          # kernelrelease 保证为纯 X.Y.Z(不受 git 状态/localversion 文件影响)
+          printf '#!/bin/sh\nexit 0\n' > scripts/setlocalversion
           : > .scmversion
           echo ">>> git 状态(诊断):"; git status -s | head -5 || true
           cd ..
