@@ -33,22 +33,27 @@ jobs:
 
       - name: 查询 flippy 内核版本并获取内核配置
         run: |
-          KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" \
-
-               | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1 || true)
-          test -n "$KV" || { echo "查询 flippy 内核版本失败"; exit 1; }
+          # 修复：将管道命令放在同一行，避免 YAML 多行解析导致续行符失效
+          KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1 || true)
+          
+          test -n "$KV" || { echo "❌ 查询 flippy 内核版本失败，请检查网络或 ophub 仓库结构是否变更"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
           echo ">>> flippy 内核: 6.12.${KV}"
+          
           curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/6.12.${KV}.tar.gz" -o /tmp/k.tar.gz
           tar xzf /tmp/k.tar.gz -C /tmp
+          
           BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
-          test -n "$BOOT_TGZ" || { echo "内核包结构异常,把日志发我"; exit 1; }
+          test -n "$BOOT_TGZ" || { echo "❌ 内核包结构异常，未找到 boot-*.tar.gz"; exit 1; }
+          
           tar tzf "${BOOT_TGZ}" > /tmp/bootlist 2>/dev/null || true
           CFG=$(grep -m1 -i '^config' /tmp/bootlist 2>/dev/null || true)
-          test -n "$CFG" || { echo "boot 包里没有 config 文件,把日志发我"; exit 1; }
+          test -n "$CFG" || { echo "❌ boot 包里没有 config 文件"; exit 1; }
+          
           mkdir -p ksrc
           tar xzf "${BOOT_TGZ}" -O "$CFG" > ksrc/.config 2>/dev/null || true
-          test "$(wc -l < ksrc/.config)" -gt 1000 || { echo ".config 无效,把日志发我"; exit 1; }
+          test "$(wc -l < ksrc/.config)" -gt 1000 || { echo "❌ .config 无效（行数不足）"; exit 1; }
+          
           echo ">>> 内核配置已获取 ($(wc -l < ksrc/.config) 行)"
           grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=' ksrc/.config || true
 
