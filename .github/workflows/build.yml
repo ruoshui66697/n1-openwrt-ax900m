@@ -75,10 +75,12 @@ jobs:
       - name: 完整编译内核(内核+dtb+模块+AX900M驱动,同一构建树)
         run: |
           cd ksrc-src
-
+          KV="${{ env.KV }}"
+          # [诊断] olddefconfig 前后的分区/文件系统配置差异
           grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_before 2>/dev/null || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           KREL=$(make -s ARCH=arm64 kernelrelease)
+          echo "KREL=${KREL}" >> $GITHUB_ENV
           echo ">>> 内核真实版本号: ${KREL}"
           grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_after 2>/dev/null || true
           echo ">>> olddefconfig 配置差异:"; diff /tmp/cfg_before /tmp/cfg_after || true
@@ -193,7 +195,7 @@ jobs:
           cd /tmp/rel
           tar czf boot-${KV}.tar.gz -C boot .
           tar czf dtb-amlogic-${KV}.tar.gz -C dtb .
-          tar czf modules-${KV}.tar.gz -C /tmp/kmod/lib/modules ${KREL:-${KV}}
+          tar czf modules-${KV}.tar.gz -C /tmp/kmod/lib/modules ${{ env.KREL }}
           ls -lh *.tar.gz
           mkdir -p wrap/${KV}
           mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/${KV}/
