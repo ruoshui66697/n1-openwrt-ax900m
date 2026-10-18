@@ -68,6 +68,9 @@ jobs:
           mv ../ksrc/.config .
           scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
           grep -E 'CONFIG_LOCALVERSION' .config || true
+          # 封印 git 脏树标记: 空 .scmversion 让 setlocalversion 直接跳过, 版本号保证为 ${KV}
+          : > .scmversion
+          echo ">>> git 状态(诊断):"; git status -s | head -5 || true
           cd ..
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
@@ -390,8 +393,8 @@ jobs:
             TITLE="[N1固件] 构建失败"
             CONTENT="请到 Actions 查看失败步骤日志(Ctrl+F 搜 Error)。"
           fi
-          curl -sS -X POST \
+          RESP=$(curl -sS -X POST \
             "https://oapi.dingtalk.com/robot/send?access_token=${{ secrets.DINGTALK_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${TITLE} ${CONTENT} ${RUN_URL}\"}}" \
-            || echo ">>> 钉钉推送失败(不影响构建)"
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${TITLE} ${CONTENT} ${RUN_URL}\"}}" || true)
+          echo ">>> 钉钉响应: ${RESP}"
