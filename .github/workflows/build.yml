@@ -136,6 +136,7 @@ jobs:
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                INSTALL_MOD_PATH=/tmp/kmod \
                INSTALL_MOD_STRIP=1 \
+               KERNELRELEASE="${KREL}" \
                DEPMOD=true \
                modules_install
           
