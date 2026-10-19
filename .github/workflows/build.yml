@@ -136,7 +136,7 @@ jobs:
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                INSTALL_MOD_PATH=/tmp/kmod \
                INSTALL_MOD_STRIP=1 \
-               DEPMOP=/bin/true \
+               DEPMOD=true \
                modules_install
           
           mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
@@ -345,7 +345,6 @@ jobs:
           download_ipk() {
             local sub="$1" pkg="$2" file
             file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
-
                    | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}' || true)
             case "$file" in
               */*) ;;
