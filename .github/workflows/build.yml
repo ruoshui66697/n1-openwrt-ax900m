@@ -92,7 +92,6 @@ jobs:
           cd ksrc-src
           KV="${{ env.KV }}"
           
-          # 强制开启关键启动驱动为内置 (=y)，防止 initramfs 加载模块失败
           scripts/config -e CONFIG_BLK_DEV_SD
           scripts/config -e CONFIG_BLK_DEV_SR
           scripts/config -e CONFIG_USB_STORAGE
@@ -125,7 +124,6 @@ jobs:
                DEPMOD=true \
                modules_install
           
-          # 编译无线驱动
           mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules 2>>"$ERR_FILE"
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
@@ -147,20 +145,19 @@ jobs:
             -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
           cp usb_modeswitch "$OLDPWD/"
 
-      - name: 编译 busybox 静态二进制 (用于自制 initramfs)
+      - name: 编译 busybox 静态二进制
         run: |
           curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
           cd /tmp/busybox-1.36.1
           make defconfig
           sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
           sed -i 's/^CONFIG_STATIC=n/CONFIG_STATIC=y/' .config
-          # 确保 blkid 和 findfs 被编译
           sed -i 's/^# CONFIG_BLKID is not set/CONFIG_BLKID=y/' .config
           sed -i 's/^# CONFIG_FINDFS is not set/CONFIG_FINDFS=y/' .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) 2>>"$ERR_FILE"
           cp busybox "$OLDPWD/"
 
-      - name: 打包内核并发布 Release (重构 Initramfs 解决 U 盘卡死)
+      - name: 打包内核并发布 Release (重构 Initramfs)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -172,25 +169,22 @@ jobs:
           cp .config /tmp/rel/boot/config-${KV}
           cp System.map /tmp/rel/boot/System.map-${KV}
 
-          # === 重构 Initramfs 开始 ===
           rm -rf /tmp/initrd 
-          # 必须创建完整的 Linux 基础目录，否则 busybox 会崩溃
-          mkdir -p /tmp/initrd/{bin,sbin,proc,sys,dev,mnt,etc,tmp,var,run,root,lib/modules,usr/bin,usr/sbin}
+          mkdir -p /tmp/initrd/bin /tmp/initrd/sbin /tmp/initrd/proc /tmp/initrd/sys \
+                   /tmp/initrd/dev /tmp/initrd/mnt /tmp/initrd/etc /tmp/initrd/tmp \
+                   /tmp/initrd/var /tmp/initrd/run /tmp/initrd/root /tmp/initrd/lib/modules \
+                   /tmp/initrd/usr/bin /tmp/initrd/usr/sbin
           
           cp "$GITHUB_WORKSPACE/busybox" /tmp/initrd/bin/busybox
           chmod +x /tmp/initrd/bin/busybox
-          
-          # 安装所有 busybox applets
           /tmp/initrd/bin/busybox --install -s /tmp/initrd/bin
           /tmp/initrd/bin/busybox --install -s /tmp/initrd/sbin
           
-          # 拷贝内核模块
-          cp -r /tmp/kmod/lib/modules/${KREL} /tmp/initrd/lib/modules/
+          cp -r /tmp/kmod/lib/modules/$KREL /tmp/initrd/lib/modules/
 
-          # 编写高健壮性的 init 脚本
-          cat > /tmp/initrd/init <<'EOF'
+          # 【关键修复】使用纯 Shell 变量 $VAR 替代 ${VAR}，避免 YAML 解析器报错
+          cat > /tmp/initrd/init <<'INITSCRIPT'
 #!/bin/busybox sh
-# 重定向所有输出到控制台，方便排查卡死问题
 exec >/dev/console 2>&1
 export PATH=/bin:/sbin
 
@@ -198,7 +192,6 @@ echo "========================================="
 echo "  N1 Custom Initramfs (Debug Enabled)    "
 echo "========================================="
 
-# 挂载基础文件系统
 mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -208,7 +201,6 @@ mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /run
 
 echo "[init] 加载存储与文件系统模块..."
-# 尝试加载模块 (如果内核已内置则忽略错误)
 for mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do
     modprobe $mod 2>/dev/null && echo "  [+] Loaded: $mod" || echo "  [-] Skipped/Built-in: $mod"
 done
@@ -222,9 +214,7 @@ ls -l /dev/sd* /dev/mmcblk* 2>/dev/null || echo "  (未找到 sd/mmcblk 设备)"
 ROOT_DEV=""
 MOUNT_OPTS=""
 
-# 探测根分区函数
 find_root() {
-    # 优先通过 LABEL 查找 (ophub 默认标签通常是 ROOTFS)
     if [ -x /bin/findfs ]; then
         ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null)
         if [ -n "$ROOT_DEV" ]; then
@@ -233,19 +223,16 @@ find_root() {
         fi
     fi
 
-    # 遍历所有可能的块设备
     for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do
         [ -b "$dev" ] || continue
         echo "[init] 尝试挂载 $dev ..."
         
-        # 尝试 Btrfs 子卷
         if mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null; then
             ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; return 0
         fi
         if mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null; then
             ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; return 0
         fi
-        # 尝试普通 Btrfs/Ext4
         if mount -t btrfs -o ro "$dev" /mnt 2>/dev/null; then
             ROOT_DEV="$dev"; return 0
         fi
@@ -256,7 +243,6 @@ find_root() {
     return 1
 }
 
-# 执行探测，如果失败则增加延时重试
 if ! find_root; then
     echo "[init] 首次探测失败，等待 5 秒后重试..."
     sleep 5
@@ -269,7 +255,6 @@ fi
 
 echo "[init] 成功挂载根分区: $ROOT_DEV (opts: $MOUNT_OPTS)"
 
-# 重新以读写模式挂载 (为 switch_root 准备)
 umount /mnt
 if [ -n "$MOUNT_OPTS" ]; then
     mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt
@@ -279,29 +264,26 @@ fi
 
 if [ -x /mnt/sbin/init ]; then
     echo "[init] 切换根目录 (switch_root)..."
-    # 卸载基础文件系统
     umount /sys /proc /dev/pts /dev /tmp /run 2>/dev/null
     exec switch_root /mnt /sbin/init
 fi
 
 echo "!!! [init] /mnt/sbin/init 不存在或不可执行 !!!"
 exec /bin/sh
-EOF
+INITSCRIPT
           chmod +x /tmp/initrd/init
           
-          # 打包 initramfs
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
-          # === Initramfs 结束 ===
 
           cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
           cd /tmp/rel
           tar czf boot-${KV}.tar.gz --owner=0 --group=0 -C boot .
           tar czf dtb-amlogic-${KV}.tar.gz --owner=0 --group=0 -C dtb .
-          tar czf modules-${KV}.tar.gz --owner=0 --group=0 -C /tmp/kmod/lib/modules ${{ env.KREL }}
+          tar czf modules-${KV}.tar.gz --owner=0 --group=0 -C /tmp/kmod/lib/modules $KREL
           
           rm -rf /tmp/kv && mkdir -p /tmp/kv && tar xzf modules-${KV}.tar.gz -C /tmp/kv
-          test "$(ls /tmp/kv | head -1)" = "${KV}" || { echo "模块目录名不一致"; exit 1; }
+          test "$(ls /tmp/kv | head -1)" = "$KV" || { echo "模块目录名不一致"; exit 1; }
           
           mkdir -p wrap/${KV}
           mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/${KV}/
@@ -440,7 +422,7 @@ EOF
             make -j1 V=s 2>>"$ERR_FILE"
           fi
 
-      - name: 打包 N1 固件 (注入自定义内核与 Initramfs)
+      - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
           openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
@@ -449,7 +431,6 @@ EOF
           openwrt_kernel: ${{ env.KV }}
           auto_kernel: false
           openwrt_files: inject
-          # 确保传递 rootwait，让内核等待 USB 设备就绪
           openwrt_bootargs: "console=ttyAML0,115200n8 console=tty0 no_console_suspend consoleblank=0 fsck.fix=yes net.ifnames=0 macaddr=random rootwait"
 
       - name: 上传固件
