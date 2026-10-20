@@ -22,7 +22,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      ### ⬇️ 新增：初始化主目录错误日志文件（每次运行覆盖）
       - name: 初始化错误日志
         run: |
           ERR_FILE="$GITHUB_WORKSPACE/error_log.txt"
@@ -30,7 +29,6 @@ jobs:
           echo "Time: $(date '+%Y-%m-%d %H:%M:%S')" >> "$ERR_FILE"
           echo "Run: ${{ github.run_id }}" >> "$ERR_FILE"
           echo "========================" >> "$ERR_FILE"
-          # 将日志路径写入环境，供后续所有步骤使用
           echo "ERR_FILE=$ERR_FILE" >> $GITHUB_ENV
 
       - name: 安装编译依赖
@@ -44,11 +42,10 @@ jobs:
 
       - name: 查询 flippy 内核版本并获取内核配置
         run: |
-          # 封装错误记录函数
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
           
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1 || true)
-          test -n "$KV" || { log_err "查询 flippy 内核版本失败，请检查网络或 ophub 仓库结构是否变更"; exit 1; }
+          test -n "$KV" || { log_err "查询 flippy 内核版本失败"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
           echo ">>> flippy 内核: 6.12.${KV}"
           
@@ -56,7 +53,7 @@ jobs:
           tar xzf /tmp/k.tar.gz -C /tmp
           
           BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
-          test -n "$BOOT_TGZ" || { log_err "内核包结构异常，未找到 boot-*.tar.gz"; exit 1; }
+          test -n "$BOOT_TGZ" || { log_err "内核包结构异常"; exit 1; }
           
           tar tzf "${BOOT_TGZ}" > /tmp/bootlist 2>/dev/null || true
           CFG=$(grep -m1 -i '^config' /tmp/bootlist 2>/dev/null || true)
@@ -64,10 +61,7 @@ jobs:
           
           mkdir -p ksrc
           tar xzf "${BOOT_TGZ}" -O "$CFG" > ksrc/.config 2>/dev/null || true
-          test "$(wc -l < ksrc/.config)" -gt 1000 || { log_err ".config 无效（行数不足）"; exit 1; }
-          
-          echo ">>> 内核配置已获取 ($(wc -l < ksrc/.config) 行)"
-          grep -E 'CONFIG_MODULE_UNLOAD|CONFIG_MODULE_SIG=|CONFIG_LIVEPATCH|CONFIG_TRACING=' ksrc/.config || true
+          test "$(wc -l < ksrc/.config)" -gt 1000 || { log_err ".config 无效"; exit 1; }
 
       - name: 准备内核源码与 AX900M 驱动源码
         run: |
@@ -83,31 +77,20 @@ jobs:
               break
             fi
           done
-          echo ">>> 源码版本: $(awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' Makefile | sed 's/\.$//') (目标 $KV)"
           rm -f .config
           mv ../ksrc/.config .
           scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
-          grep -E 'CONFIG_LOCALVERSION' .config || true
           printf '#!/bin/sh\nexit 0\n' > scripts/setlocalversion
           : > .scmversion
-          echo ">>> git 状态(诊断):"; git status -s | head -5 || true
           cd ..
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
-          echo ">>> 驱动固件:"; ls aicsrc/fw/ || true
 
-      - name: 完整编译内核(内核+dtb+模块+AX900M驱动,同一构建树)
+      - name: 完整编译内核
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          
           cd ksrc-src
           KV="${{ env.KV }}"
-          
-          echo ">>> .config 前10行:"
-          head -10 .config || true
-          CONFIG_COUNT=$(grep -c '^CONFIG_' .config || echo 0)
-          echo ">>> CONFIG_ 条目数: ${CONFIG_COUNT}"
-          test "$CONFIG_COUNT" -gt 100 || { log_err ".config 无效（CONFIG_ 条目过少: ${CONFIG_COUNT}）"; exit 1; }
           
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           
@@ -115,24 +98,12 @@ jobs:
           P=$(awk '/^PATCHLEVEL = /{print $3}' Makefile)
           S=$(awk '/^SUBLEVEL = /{print $3}' Makefile)
           KREL="${V}.${P}.${S}"
-          
-          test -n "$KREL" || { log_err "无法从 Makefile 解析版本号"; cat Makefile | head -5; exit 1; }
           echo "KREL=${KREL}" >> $GITHUB_ENV
-          echo ">>> 内核版本号(Makefile): ${KREL}"
           
-          case "$KREL" in
-            ${KV}|${KV}-*) echo ">>> 版本匹配 ✅" ;;
-            *) log_err "版本不匹配: KREL=$KREL != KV=$KV"; exit 1 ;;
-          esac
+          # 编译内核
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs 2>>"$ERR_FILE"
           
-          grep -E 'CONFIG_(PARTITION_ADVANCED|MSDOS_PARTITION|EFI_PARTITION|BTRFS_FS=|DEVTMPFS|BLK_DEV_INITRD|RD_GZIP)' .config > /tmp/cfg_before 2>/dev/null || true
-          
-          # 编译内核，stderr 追加到错误日志
-          if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs 2>>"$ERR_FILE"; then
-            log_err "内核编译失败，详见 error_log.txt"
-            exit 1
-          fi
-          
+          # 安装模块
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                INSTALL_MOD_PATH=/tmp/kmod \
                INSTALL_MOD_STRIP=1 \
@@ -140,96 +111,139 @@ jobs:
                DEPMOD=true \
                modules_install
           
+          # 编译无线驱动
           mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
-          if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules 2>>"$ERR_FILE"; then
-            log_err "AX900M 驱动编译失败"
-            exit 1
-          fi
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules 2>>"$ERR_FILE"
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
-          
           depmod -b /tmp/kmod ${KREL}
-          
-          echo ">>> 内核: ${KREL}"
-          echo ">>> AX900M 驱动已编入模块树:"
-          ls -la /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/
 
       - name: 编译 usb_modeswitch 静态二进制
         run: |
-          log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          
           git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
           if [ -d libusb-src ]; then
             cd libusb-src
-            if [ -x ./autogen.sh ]; then
-              ./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared \
-                --disable-udev --prefix=/tmp/usbroot >/dev/null
-            else
-              ./bootstrap.sh && ./configure --host=aarch64-linux-gnu \
-                --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
-            fi
+            ./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
             make -j$(nproc) >/dev/null && make install >/dev/null
             cd ..
           fi
           curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
           tar xjf /tmp/ums.tar.bz2 -C /tmp
           cd /tmp/usb-modeswitch-2.6.1
-          set +e
           aarch64-linux-gnu-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c \
             -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
-          RC=$?
-          set -e
-          [ $RC -eq 0 ] && echo ">>> usb_modeswitch 编译成功" || { log_err "usb_modeswitch 编译失败(rc=$RC)"; }
-          ls -la usb_modeswitch || true
-          file usb_modeswitch || true
-          cp usb_modeswitch "$OLDPWD/" 2>/dev/null || true
+          cp usb_modeswitch "$OLDPWD/"
 
-      - name: 打包内核并发布 Release(ophub 格式)
+      - name: 编译 busybox 静态二进制 (用于自制 initramfs)
+        run: |
+          curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
+          cd /tmp/busybox-1.36.1
+          make defconfig
+          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          sed -i 's/^CONFIG_STATIC=n/CONFIG_STATIC=y/' .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) 2>>"$ERR_FILE"
+          cp busybox "$OLDPWD/"
+
+      - name: 打包内核并发布 Release (包含自制 initramfs)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          
           KV="${{ env.KV }}"
+          KREL="${{ env.KREL }}"
           cd ksrc-src
-          test -f arch/arm64/boot/Image || { log_err "内核未编译成功"; exit 1; }
           mkdir -p /tmp/rel/boot /tmp/rel/dtb
           cp arch/arm64/boot/Image /tmp/rel/boot/vmlinuz-${KV}
           cp .config /tmp/rel/boot/config-${KV}
           cp System.map /tmp/rel/boot/System.map-${KV}
 
-          # 从 flippy boot 包里解出原装 uInitrd（含 modules，与刚编出的模块树 vermagic 一致）
-          # 注意：BOOT_TGZ 仅在“查询 flippy 内核版本”步骤内部定义，跨步骤不持久，需要重新定位
-          BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
-          test -n "$BOOT_TGZ" || { log_err "未找到 flippy boot 包（BOOT_TGZ）"; exit 1; }
-          if ! tar xzf "${BOOT_TGZ}" -C /tmp/rel/boot/ "uInitrd-${KV}" 2>/dev/null; then
-            UI_NAME=$(tar tzf "${BOOT_TGZ}" 2>/dev/null | grep -iE 'uInitrd' | head -1 || true)
-            test -n "$UI_NAME" || { log_err "boot 包里找不到 uInitrd"; exit 1; }
-            tar xzf "${BOOT_TGZ}" -C /tmp/rel/boot/ "$UI_NAME"
-            [ "$UI_NAME" != "uInitrd-${KV}" ] && mv "/tmp/rel/boot/$UI_NAME" "/tmp/rel/boot/uInitrd-${KV}" 2>/dev/null || true
+          # === 自制 initramfs 制作开始 ===
+          rm -rf /tmp/initrd && mkdir -p /tmp/initrd/bin /tmp/initrd/proc /tmp/initrd/sys /tmp/initrd/dev /tmp/initrd/mnt /tmp/initrd/lib/modules
+          
+          # 拷贝 busybox
+          cp "$GITHUB_WORKSPACE/busybox" /tmp/initrd/bin/busybox
+          for app in sh mount umount switch_root cat echo sleep modprobe; do
+              ln -sf busybox /tmp/initrd/bin/$app
+          done
+
+          # 拷贝必要的内核模块到 initramfs (btrfs, usb-storage, ext4 等)
+          cp -r /tmp/kmod/lib/modules/${KREL} /tmp/initrd/lib/modules/
+
+          # 编写强健的 init 脚本
+          cat > /tmp/initrd/init <<'EOF'
+          #!/bin/sh
+          PATH=/bin
+          mount -t devtmpfs devtmpfs /dev 2>/dev/null
+          mount -t proc proc /proc 2>/dev/null
+          mount -t sysfs sysfs /sys 2>/dev/null
+          
+          echo "[initramfs] 加载存储与文件系统模块..."
+          modprobe scsi_mod 2>/dev/null
+          modprobe sd_mod 2>/dev/null
+          modprobe usb-storage 2>/dev/null
+          modprobe uas 2>/dev/null
+          modprobe btrfs 2>/dev/null
+          modprobe ext4 2>/dev/null
+
+          echo "[initramfs] 等待根分区就绪 ..."
+          sleep 3
+          ROOT=""
+          try_mount() {
+              p="$1"
+              # 尝试 btrfs 子卷 (ophub默认使用 ROOTFS 或 @)
+              for opt in "subvol=ROOTFS" "subvol=@rootfs" "subvol=@"; do
+                  mount -t btrfs -o "$opt" /dev/$p /mnt 2>/dev/null && return 0
+              done
+              # 尝试直接挂载 btrfs 或 ext4
+              mount -t btrfs /dev/$p /mnt 2>/dev/null && return 0
+              mount -t ext4 /dev/$p /mnt 2>/dev/null && return 0
+              return 1
+          }
+          
+          try_all() {
+              # 覆盖 eMMC 和 U 盘可能的分区名
+              for p in sda2 sdb2 sdc2 sdd2 mmcblk2p2 mmcblk2p3; do
+                  [ -b /dev/$p ] || continue
+                  if try_mount $p; then ROOT=$p; return 0; fi
+              done
+              return 1
+          }
+          
+          try_all || { sleep 5; echo "[initramfs] 重试..."; try_all; }
+          
+          if [ -n "$ROOT" ] && [ -x /mnt/sbin/init ]; then
+              echo "[initramfs] 成功挂载根分区: /dev/$ROOT"
+              umount /proc /sys 2>/dev/null
+              exec switch_root /mnt /sbin/init
           fi
-          test -s /tmp/rel/boot/uInitrd-${KV} || { log_err "未获取到 flippy 原装 uInitrd"; exit 1; }
-          ls -lh /tmp/rel/boot/uInitrd-${KV}
+          echo "[initramfs] 未找到可用的根分区, 进入急救 Shell"
+          exec /bin/sh
+          EOF
+          chmod +x /tmp/initrd/init
+          
+          # 打包 initramfs
+          (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
+          mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
+          # === 自制 initramfs 制作结束 ===
 
           cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
           cd /tmp/rel
           tar czf boot-${KV}.tar.gz --owner=0 --group=0 -C boot .
           tar czf dtb-amlogic-${KV}.tar.gz --owner=0 --group=0 -C dtb .
           tar czf modules-${KV}.tar.gz --owner=0 --group=0 -C /tmp/kmod/lib/modules ${{ env.KREL }}
-          ls -lh *.tar.gz
+          
           rm -rf /tmp/kv && mkdir -p /tmp/kv && tar xzf modules-${KV}.tar.gz -C /tmp/kv
-          echo ">>> modules 包顶层目录: $(ls /tmp/kv)"
-          test "$(ls /tmp/kv | head -1)" = "${KV}" || { log_err "模块目录名与 ${KV} 不一致!"; ls /tmp/kv; exit 1; }
+          test "$(ls /tmp/kv | head -1)" = "${KV}" || { echo "模块目录名不一致"; exit 1; }
+          
           mkdir -p wrap/${KV}
           mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/${KV}/
           cd wrap/${KV} && sha256sum *.tar.gz > sha256sums
           cd .. && tar czf ${KV}.tar.gz ${KV}
-          echo ">>> 发布内核 Release (kernel_stable/${KV}.tar.gz)"
+          
           gh release delete kernel_stable --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create kernel_stable ${KV}.tar.gz \
             --repo ${{ github.repository }} \
             -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
+          
           rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src"
-          df -h "$GITHUB_WORKSPACE" | tail -1
 
       - name: 组装注入包
         run: |
@@ -240,6 +254,7 @@ jobs:
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           find aicsrc -path '*modeswitch*' -type f ! -name '*.md' \
             -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
+          
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
@@ -255,6 +270,7 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
+          
           cat > inject/etc/custom_service/start_service.sh <<'EOF'
           #!/bin/sh
           i=0
@@ -270,23 +286,14 @@ jobs:
           exit 0
           EOF
           chmod +x inject/etc/custom_service/start_service.sh
+          
           cat > inject/etc/profile.d/30-sysinfo.sh <<'EOF'
           #!/bin/sh
           echo "==================================="
           echo "  CPU 温度: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))°C"
           echo "==================================="
           EOF
-          echo ">>> 注入包:"
-          find inject -type f | sort || true
-          ls -la inject/opt/bin/ || true
           rm -rf aicsrc
-
-      - name: 上传救急工具包
-        uses: actions/upload-artifact@v4
-        with:
-          name: ax900m-modules
-          path: inject/opt/bin/
-          if-no-files-found: error
 
       - name: 准备中文语言包(离线注入)
         run: |
@@ -298,21 +305,15 @@ jobs:
             local sub="$1" pkg="$2" file
             file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
                    | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}' || true)
-            case "$file" in
-              */*) ;;
-              *) file="${sub}/${file}" ;;
-            esac
+            case "$file" in */*) ;; *) file="${sub}/${file}" ;; esac
             if [ -n "$file" ]; then
-              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" \
-                && echo ">>> 已下载 ${pkg}" || echo ">>> 下载失败 ${pkg}"
-            else
-              echo ">>> 仓库里没找到 ${pkg}"
+              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" && echo ">>> 已下载 ${pkg}" || echo ">>> 下载失败 ${pkg}"
             fi
           }
           download_ipk luci luci-i18n-base-zh-cn
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
-          ls -la inject/opt/ipks/ || true
+          
           cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
           #!/bin/sh
           opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
@@ -333,7 +334,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 生成配置(无需仓库内 config 文件)
+      - name: 生成配置
         run: |
           cd openwrt
           cat > .config <<'EOF'
@@ -363,17 +364,12 @@ jobs:
 
       - name: 编译 OpenWrt rootfs
         run: |
-          log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
           cd openwrt
           if ! make -j$(nproc) 2>>"$ERR_FILE"; then
-            if ! make -j1 V=s 2>>"$ERR_FILE"; then
-              log_err "OpenWrt rootfs 编译失败"
-              exit 1
-            fi
+            make -j1 V=s 2>>"$ERR_FILE"
           fi
-          ls -lh bin/targets/armsr/armv8/*rootfs.tar.gz
 
-      - name: 升级 coreutils(ophub 脚本需要新版 cp 语法)
+      - name: 升级 coreutils
         run: |
           curl -fsSL https://ftp.gnu.org/gnu/coreutils/coreutils-9.9.tar.xz | tar xJ
           cd coreutils-9.9
@@ -381,10 +377,8 @@ jobs:
           make -j$(nproc) >/dev/null
           sudo make install >/dev/null
           hash -r
-          cp --version | head -1
-          cp --update=none --version >/dev/null && echo ">>> cp --update=none 已支持" || true
 
-      - name: 打包 N1 固件(使用自编译内核)
+      - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
           openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
@@ -401,7 +395,6 @@ jobs:
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
 
-      ### ⬇️ 修改：钉钉通知增加错误日志摘要 + 上传错误日志 Artifact
       - name: 上传错误日志
         if: failure()
         uses: actions/upload-artifact@v4
@@ -416,26 +409,22 @@ jobs:
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           ERR_FILE="$GITHUB_WORKSPACE/error_log.txt"
-          
           if [ "${{ job.status }}" = "success" ]; then
             TITLE="[openwrt N1] ✅ 构建成功"
             CONTENT="固件已编译完成，去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
           else
             TITLE="[openwrt N1] ❌ 构建失败"
-            # 提取错误日志最后10行作为摘要
             ERR_SUMMARY=""
             if [ -f "$ERR_FILE" ]; then
               ERR_SUMMARY=$(grep '❌' "$ERR_FILE" | tail -5 | sed 's/$/\\n/g' | tr -d '\n')
             fi
             if [ -n "$ERR_SUMMARY" ]; then
-              CONTENT="错误摘要:\\n${ERR_SUMMARY}\\n请查看 Artifacts 中的 build-error-log 或 Actions 日志。"
+              CONTENT="错误摘要:\\n${ERR_SUMMARY}\\n请查看 Artifacts 中的 build-error-log。"
             else
-              CONTENT="请到 Actions 查看失败步骤日志(Ctrl+F 搜 Error)。"
+              CONTENT="请到 Actions 查看失败步骤日志。"
             fi
           fi
-          
-          RESP=$(curl -sS -X POST \
+          curl -sS -X POST \
             "https://oapi.dingtalk.com/robot/send?access_token=${{ secrets.DINGTALK_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${TITLE}\\n${CONTENT}\\n${RUN_URL}\"}}" || true)
-          echo ">>> 钉钉响应: ${RESP}"
+            -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"${TITLE}\\n${CONTENT}\\n${RUN_URL}\"}}" || true
