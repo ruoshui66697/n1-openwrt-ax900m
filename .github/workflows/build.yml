@@ -43,22 +43,17 @@ jobs:
       - name: 查询 flippy 内核版本并获取内核配置
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          
           KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" | grep -oP '6\.12\.\K[0-9]+(?=\.tar\.gz)' | sort -un | tail -1 || true)
           test -n "$KV" || { log_err "查询 flippy 内核版本失败"; exit 1; }
           echo "KV=6.12.${KV}" >> $GITHUB_ENV
           echo ">>> flippy 内核: 6.12.${KV}"
-          
           curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/6.12.${KV}.tar.gz" -o /tmp/k.tar.gz
           tar xzf /tmp/k.tar.gz -C /tmp
-          
           BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
           test -n "$BOOT_TGZ" || { log_err "内核包结构异常"; exit 1; }
-          
           tar tzf "${BOOT_TGZ}" > /tmp/bootlist 2>/dev/null || true
           CFG=$(grep -m1 -i '^config' /tmp/bootlist 2>/dev/null || true)
           test -n "$CFG" || { log_err "boot 包里没有 config 文件"; exit 1; }
-          
           mkdir -p ksrc
           tar xzf "${BOOT_TGZ}" -O "$CFG" > ksrc/.config 2>/dev/null || true
           test "$(wc -l < ksrc/.config)" -gt 1000 || { log_err ".config 无效"; exit 1; }
@@ -66,7 +61,6 @@ jobs:
       - name: 准备内核源码与 AX900M 驱动源码
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          
           rm -rf ksrc-src && git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc-src
           cd ksrc-src
           KV="${{ env.KV }}"
@@ -91,7 +85,6 @@ jobs:
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
           cd ksrc-src
           KV="${{ env.KV }}"
-          
           scripts/config -e CONFIG_BLK_DEV_SD
           scripts/config -e CONFIG_BLK_DEV_SR
           scripts/config -e CONFIG_USB_STORAGE
@@ -106,24 +99,19 @@ jobs:
           scripts/config -e CONFIG_USB_XHCI_HCD
           scripts/config -e CONFIG_USB_EHCI_HCD
           scripts/config -e CONFIG_USB_DWC3
-          
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          
           V=$(awk '/^VERSION = /{print $3}' Makefile)
           P=$(awk '/^PATCHLEVEL = /{print $3}' Makefile)
           S=$(awk '/^SUBLEVEL = /{print $3}' Makefile)
           KREL="${V}.${P}.${S}"
           echo "KREL=${KREL}" >> $GITHUB_ENV
-          
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs 2>>"$ERR_FILE"
-          
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                INSTALL_MOD_PATH=/tmp/kmod \
                INSTALL_MOD_STRIP=1 \
                KERNELRELEASE="${KREL}" \
                DEPMOD=true \
                modules_install
-          
           mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules 2>>"$ERR_FILE"
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
@@ -157,7 +145,7 @@ jobs:
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) 2>>"$ERR_FILE"
           cp busybox "$OLDPWD/"
 
-      - name: 打包内核并发布 Release (重构 Initramfs)
+      - name: 打包内核并发布 Release (重构 Initramfs - 修复 YAML 报错)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -179,100 +167,48 @@ jobs:
           chmod +x /tmp/initrd/bin/busybox
           /tmp/initrd/bin/busybox --install -s /tmp/initrd/bin
           /tmp/initrd/bin/busybox --install -s /tmp/initrd/sbin
-          
           cp -r /tmp/kmod/lib/modules/$KREL /tmp/initrd/lib/modules/
 
-          # 【关键修复】使用纯 Shell 变量 $VAR 替代 ${VAR}，避免 YAML 解析器报错
-          cat > /tmp/initrd/init <<'INITSCRIPT'
-#!/bin/busybox sh
-exec >/dev/console 2>&1
-export PATH=/bin:/sbin
-
-echo "========================================="
-echo "  N1 Custom Initramfs (Debug Enabled)    "
-echo "========================================="
-
-mount -t devtmpfs devtmpfs /dev
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mkdir -p /dev/pts /dev/shm
-mount -t devpts devpts /dev/pts
-mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /run
-
-echo "[init] 加载存储与文件系统模块..."
-for mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do
-    modprobe $mod 2>/dev/null && echo "  [+] Loaded: $mod" || echo "  [-] Skipped/Built-in: $mod"
-done
-
-echo "[init] 等待 USB 设备枚举 (sleep 5)..."
-sleep 5
-
-echo "[init] 当前块设备列表:"
-ls -l /dev/sd* /dev/mmcblk* 2>/dev/null || echo "  (未找到 sd/mmcblk 设备)"
-
-ROOT_DEV=""
-MOUNT_OPTS=""
-
-find_root() {
-    if [ -x /bin/findfs ]; then
-        ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null)
-        if [ -n "$ROOT_DEV" ]; then
-            echo "[init] 通过 LABEL=ROOTFS 找到: $ROOT_DEV"
-            return 0
-        fi
-    fi
-
-    for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do
-        [ -b "$dev" ] || continue
-        echo "[init] 尝试挂载 $dev ..."
-        
-        if mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null; then
-            ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; return 0
-        fi
-        if mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null; then
-            ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; return 0
-        fi
-        if mount -t btrfs -o ro "$dev" /mnt 2>/dev/null; then
-            ROOT_DEV="$dev"; return 0
-        fi
-        if mount -t ext4 -o ro "$dev" /mnt 2>/dev/null; then
-            ROOT_DEV="$dev"; return 0
-        fi
-    done
-    return 1
-}
-
-if ! find_root; then
-    echo "[init] 首次探测失败，等待 5 秒后重试..."
-    sleep 5
-    if ! find_root; then
-        echo "!!! [init] 致命错误: 无法挂载根分区 !!!"
-        echo "进入急救 Shell。请检查 U 盘是否插好，或输入 'ls /dev' 查看设备。"
-        exec /bin/sh
-    fi
-fi
-
-echo "[init] 成功挂载根分区: $ROOT_DEV (opts: $MOUNT_OPTS)"
-
-umount /mnt
-if [ -n "$MOUNT_OPTS" ]; then
-    mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt
-else
-    mount "$ROOT_DEV" /mnt
-fi
-
-if [ -x /mnt/sbin/init ]; then
-    echo "[init] 切换根目录 (switch_root)..."
-    umount /sys /proc /dev/pts /dev /tmp /run 2>/dev/null
-    exec switch_root /mnt /sbin/init
-fi
-
-echo "!!! [init] /mnt/sbin/init 不存在或不可执行 !!!"
-exec /bin/sh
-INITSCRIPT
-          chmod +x /tmp/initrd/init
+          # 【核心修复】使用 printf 逐行写入 init 脚本，彻底避免 YAML Heredoc 解析错误
+          {
+            printf '#!/bin/busybox sh\n'
+            printf 'exec >/dev/console 2>&1\n'
+            printf 'export PATH=/bin:/sbin\n'
+            printf 'echo "=== N1 Custom Initramfs ==="\n'
+            printf 'mount -t devtmpfs devtmpfs /dev\n'
+            printf 'mount -t proc proc /proc\n'
+            printf 'mount -t sysfs sysfs /sys\n'
+            printf 'mkdir -p /dev/pts /dev/shm\n'
+            printf 'mount -t devpts devpts /dev/pts\n'
+            printf 'mount -t tmpfs tmpfs /tmp\n'
+            printf 'mount -t tmpfs tmpfs /run\n'
+            printf 'echo "[init] Loading storage modules..."\n'
+            printf 'for mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do modprobe $mod 2>/dev/null; done\n'
+            printf 'echo "[init] Waiting for USB (5s)..."\n'
+            printf 'sleep 5\n'
+            printf 'ls -l /dev/sd* /dev/mmcblk* 2>/dev/null || echo "(No devices found)"\n'
+            printf 'ROOT_DEV=""\n'
+            printf 'MOUNT_OPTS=""\n'
+            printf 'find_root() {\n'
+            printf '    if [ -x /bin/findfs ]; then ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null); [ -n "$ROOT_DEV" ] && return 0; fi\n'
+            printf '    for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do\n'
+            printf '        [ -b "$dev" ] || continue\n'
+            printf '        mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; return 0; }\n'
+            printf '        mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; return 0; }\n'
+            printf '        mount -t btrfs -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; return 0; }\n'
+            printf '        mount -t ext4 -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; return 0; }\n'
+            printf '    done\n'
+            printf '    return 1\n'
+            printf '}\n'
+            printf 'if ! find_root; then sleep 5; if ! find_root; then echo "!!! FATAL: Cannot mount rootfs !!!"; exec /bin/sh; fi; fi\n'
+            printf 'echo "[init] Root found: $ROOT_DEV"\n'
+            printf 'umount /mnt\n'
+            printf '[ -n "$MOUNT_OPTS" ] && mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt\n'
+            printf 'if [ -x /mnt/sbin/init ]; then umount /sys /proc /dev/pts /dev /tmp /run 2>/dev/null; exec switch_root /mnt /sbin/init; fi\n'
+            printf 'echo "!!! /mnt/sbin/init missing !!!"; exec /bin/sh\n'
+          } > /tmp/initrd/init
           
+          chmod +x /tmp/initrd/init
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
 
@@ -293,7 +229,7 @@ INITSCRIPT
           gh release delete kernel_stable --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create kernel_stable ${KV}.tar.gz \
             --repo ${{ github.repository }} \
-            -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M (Fixed USB Boot)"
+            -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M (Fixed YAML)"
           
           rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src"
 
@@ -307,44 +243,17 @@ INITSCRIPT
           find aicsrc -path '*modeswitch*' -type f ! -name '*.md' \
             -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
           
-          cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
-#!/bin/sh
-[ "$ACTION" = "add" ] || exit 0
-case "$PRODUCT" in
-    a69c:8d80*|a69c:8d83*)
-        modprobe aic_load_fw 2>/dev/null ;;
-    a69c:8d81*|368b:8d81*)
-        modprobe cfg80211 2>/dev/null
-        modprobe aic8800_fdrv 2>/dev/null
-        modprobe aic_zlp_quirk 2>/dev/null
-        modprobe btusb 2>/dev/null ;;
-esac
-exit 0
-EOF
+          # 使用 printf 写入 hotplug 脚本
+          printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    a69c:8d80*|a69c:8d83*) modprobe aic_load_fw 2>/dev/null ;;\n    a69c:8d81*|368b:8d81*) modprobe cfg80211 2>/dev/null; modprobe aic8800_fdrv 2>/dev/null; modprobe aic_zlp_quirk 2>/dev/null; modprobe btusb 2>/dev/null ;;\nesac\nexit 0\n' > inject/etc/hotplug.d/usb/99-aic8800
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          cat > inject/etc/custom_service/start_service.sh <<'EOF'
-#!/bin/sh
-i=0
-while [ $i -lt 40 ]; do
-    lsusb | grep -qiE 'a69c|368b' && break
-    if lsusb | grep -q "1111:1111"; then
-        usb_modeswitch -v 0x1111 -p 0x1111 \
-          -M 555342438765432100000000000010fd0000000000000000000000000000f3 \
-          -M 555342438765432100000000000010fd0000000000000000000000000000f2 >/dev/null 2>&1
-    fi
-    sleep 3; i=$((i+3))
-done
-exit 0
-EOF
+          # 使用 printf 写入 start_service 脚本
+          printf '#!/bin/sh\ni=0\nwhile [ $i -lt 40 ]; do\n    lsusb | grep -qiE "a69c|368b" && break\n    if lsusb | grep -q "1111:1111"; then\n        usb_modeswitch -v 0x1111 -p 0x1111 -M 555342438765432100000000000010fd0000000000000000000000000000f3 -M 555342438765432100000000000010fd0000000000000000000000000000f2 >/dev/null 2>&1\n    fi\n    sleep 3; i=$((i+3))\ndone\nexit 0\n' > inject/etc/custom_service/start_service.sh
           chmod +x inject/etc/custom_service/start_service.sh
           
-          cat > inject/etc/profile.d/30-sysinfo.sh <<'EOF'
-#!/bin/sh
-echo "==================================="
-echo "  CPU 温度: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))°C"
-echo "==================================="
-EOF
+          # 使用 printf 写入 profile 脚本
+          printf '#!/bin/sh\necho "==================================="\necho "  CPU Temp: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 )) C"\necho "==================================="\n' > inject/etc/profile.d/30-sysinfo.sh
+          chmod +x inject/etc/profile.d/30-sysinfo.sh
           rm -rf aicsrc
 
       - name: 准备中文语言包(离线注入)
@@ -360,23 +269,15 @@ EOF
                    | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}' || true)
             case "$file" in */*) ;; *) file="${sub}/${file}" ;; esac
             if [ -n "$file" ]; then
-              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" && echo ">>> 已下载 ${pkg}" || echo ">>> 下载失败 ${pkg}"
+              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" && echo ">>> Downloaded ${pkg}" || echo ">>> Failed ${pkg}"
             fi
           }
           download_ipk luci luci-i18n-base-zh-cn
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
           
-          cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
-#!/bin/sh
-opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
-opkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null
-for d in /usr/sbin /usr/bin /sbin /bin; do
-    cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null
-done
-uci set luci.main.lang='zh_cn' 2>/dev/null && uci commit luci 2>/dev/null
-exit 0
-EOF
+          # 使用 printf 写入 uci-defaults 脚本
+          printf '#!/bin/sh\nopkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nopkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nfor d in /usr/sbin /usr/bin /sbin /bin; do cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null; done\nuci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null\nexit 0\n' > inject/etc/uci-defaults/99-zh-cn
           chmod +x inject/etc/uci-defaults/99-zh-cn
 
       - name: 克隆 OpenWrt 源码
@@ -390,24 +291,8 @@ EOF
       - name: 生成配置
         run: |
           cd openwrt
-          cat > .config <<'EOF'
-CONFIG_TARGET_armsr=y
-CONFIG_TARGET_armsr_armv8=y
-CONFIG_TARGET_ROOTFS_TARGZ=y
-CONFIG_PACKAGE_luci=y
-CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-CONFIG_PACKAGE_wpad-mbedtls=y
-CONFIG_PACKAGE_iw=y
-CONFIG_PACKAGE_iwinfo=y
-CONFIG_PACKAGE_bluez-daemon=y
-CONFIG_PACKAGE_bluez-utils=y
-CONFIG_PACKAGE_usb-modeswitch=y
-CONFIG_PACKAGE_usbutils=y
-CONFIG_PACKAGE_mwan3=y
-CONFIG_PACKAGE_luci-app-mwan3=y
-CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
-EOF
-          sed -i 's/^          //' .config
+          # 使用 printf 写入 .config
+          printf 'CONFIG_TARGET_armsr=y\nCONFIG_TARGET_armsr_armv8=y\nCONFIG_TARGET_ROOTFS_TARGZ=y\nCONFIG_PACKAGE_luci=y\nCONFIG_PACKAGE_luci-i18n-base-zh-cn=y\nCONFIG_PACKAGE_wpad-mbedtls=y\nCONFIG_PACKAGE_iw=y\nCONFIG_PACKAGE_iwinfo=y\nCONFIG_PACKAGE_bluez-daemon=y\nCONFIG_PACKAGE_bluez-utils=y\nCONFIG_PACKAGE_usb-modeswitch=y\nCONFIG_PACKAGE_usbutils=y\nCONFIG_PACKAGE_mwan3=y\nCONFIG_PACKAGE_luci-app-mwan3=y\nCONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y\n' > .config
           make defconfig
 
       - name: 下载源码包
