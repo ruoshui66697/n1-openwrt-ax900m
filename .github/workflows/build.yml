@@ -38,7 +38,7 @@ jobs:
             gettext git libncurses-dev libssl-dev \
             python3-setuptools rsync swig unzip zlib1g-dev file wget \
             gcc-aarch64-linux-gnu bc libelf-dev kmod bzip2 \
-            zstd lz4 u-boot-tools cpio
+            zstd lz4 u-boot-tools cpio dosfstools
 
       - name: 查询 flippy 内核版本并获取内核配置
         run: |
@@ -70,7 +70,7 @@ jobs:
           rm -rf ksrc-src && git clone --depth 1 https://github.com/unifreq/linux-6.12.y.git ksrc-src
           cd ksrc-src
           KV="${{ env.KV }}"
-          for c in $(git rev-list -n 5 HEAD); do
+          for c in $(git rev-list -n 10 HEAD); do
             V=$(git show "$c:Makefile" 2>/dev/null | awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' | sed 's/\.$//')
             if [ "$V" = "$KV" ]; then
               [ "$c" != "$(git rev-parse HEAD)" ] && git checkout -q "$c"
@@ -86,11 +86,27 @@ jobs:
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git aicsrc
 
-      - name: 完整编译内核
+      - name: 完整编译内核 (强制内置 USB 存储驱动)
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
           cd ksrc-src
           KV="${{ env.KV }}"
+          
+          # 强制开启关键启动驱动为内置 (=y)，防止 initramfs 加载模块失败
+          scripts/config -e CONFIG_BLK_DEV_SD
+          scripts/config -e CONFIG_BLK_DEV_SR
+          scripts/config -e CONFIG_USB_STORAGE
+          scripts/config -e CONFIG_USB_UAS
+          scripts/config -e CONFIG_SCSI_MOD
+          scripts/config -e CONFIG_SCSI
+          scripts/config -e CONFIG_EXT4_FS
+          scripts/config -e CONFIG_BTRFS_FS
+          scripts/config -e CONFIG_FAT_FS
+          scripts/config -e CONFIG_VFAT_FS
+          scripts/config -e CONFIG_NLS_UTF8
+          scripts/config -e CONFIG_USB_XHCI_HCD
+          scripts/config -e CONFIG_USB_EHCI_HCD
+          scripts/config -e CONFIG_USB_DWC3
           
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           
@@ -100,10 +116,8 @@ jobs:
           KREL="${V}.${P}.${S}"
           echo "KREL=${KREL}" >> $GITHUB_ENV
           
-          # 编译内核
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs 2>>"$ERR_FILE"
           
-          # 安装模块
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
                INSTALL_MOD_PATH=/tmp/kmod \
                INSTALL_MOD_STRIP=1 \
@@ -140,10 +154,13 @@ jobs:
           make defconfig
           sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
           sed -i 's/^CONFIG_STATIC=n/CONFIG_STATIC=y/' .config
+          # 确保 blkid 和 findfs 被编译
+          sed -i 's/^# CONFIG_BLKID is not set/CONFIG_BLKID=y/' .config
+          sed -i 's/^# CONFIG_FINDFS is not set/CONFIG_FINDFS=y/' .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) 2>>"$ERR_FILE"
           cp busybox "$OLDPWD/"
 
-      - name: 打包内核并发布 Release (包含自制 initramfs)
+      - name: 打包内核并发布 Release (重构 Initramfs 解决 U 盘卡死)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -155,74 +172,127 @@ jobs:
           cp .config /tmp/rel/boot/config-${KV}
           cp System.map /tmp/rel/boot/System.map-${KV}
 
-          # === 自制 initramfs 制作开始 ===
-          rm -rf /tmp/initrd && mkdir -p /tmp/initrd/bin /tmp/initrd/proc /tmp/initrd/sys /tmp/initrd/dev /tmp/initrd/mnt /tmp/initrd/lib/modules
+          # === 重构 Initramfs 开始 ===
+          rm -rf /tmp/initrd 
+          # 必须创建完整的 Linux 基础目录，否则 busybox 会崩溃
+          mkdir -p /tmp/initrd/{bin,sbin,proc,sys,dev,mnt,etc,tmp,var,run,root,lib/modules,usr/bin,usr/sbin}
           
-          # 拷贝 busybox
           cp "$GITHUB_WORKSPACE/busybox" /tmp/initrd/bin/busybox
-          for app in sh mount umount switch_root cat echo sleep modprobe; do
-              ln -sf busybox /tmp/initrd/bin/$app
-          done
-
-          # 拷贝必要的内核模块到 initramfs (btrfs, usb-storage, ext4 等)
+          chmod +x /tmp/initrd/bin/busybox
+          
+          # 安装所有 busybox applets
+          /tmp/initrd/bin/busybox --install -s /tmp/initrd/bin
+          /tmp/initrd/bin/busybox --install -s /tmp/initrd/sbin
+          
+          # 拷贝内核模块
           cp -r /tmp/kmod/lib/modules/${KREL} /tmp/initrd/lib/modules/
 
-          # 编写强健的 init 脚本
+          # 编写高健壮性的 init 脚本
           cat > /tmp/initrd/init <<'EOF'
-          #!/bin/sh
-          PATH=/bin
-          mount -t devtmpfs devtmpfs /dev 2>/dev/null
-          mount -t proc proc /proc 2>/dev/null
-          mount -t sysfs sysfs /sys 2>/dev/null
-          
-          echo "[initramfs] 加载存储与文件系统模块..."
-          modprobe scsi_mod 2>/dev/null
-          modprobe sd_mod 2>/dev/null
-          modprobe usb-storage 2>/dev/null
-          modprobe uas 2>/dev/null
-          modprobe btrfs 2>/dev/null
-          modprobe ext4 2>/dev/null
+#!/bin/busybox sh
+# 重定向所有输出到控制台，方便排查卡死问题
+exec >/dev/console 2>&1
+export PATH=/bin:/sbin
 
-          echo "[initramfs] 等待根分区就绪 ..."
-          sleep 3
-          ROOT=""
-          try_mount() {
-              p="$1"
-              # 尝试 btrfs 子卷 (ophub默认使用 ROOTFS 或 @)
-              for opt in "subvol=ROOTFS" "subvol=@rootfs" "subvol=@"; do
-                  mount -t btrfs -o "$opt" /dev/$p /mnt 2>/dev/null && return 0
-              done
-              # 尝试直接挂载 btrfs 或 ext4
-              mount -t btrfs /dev/$p /mnt 2>/dev/null && return 0
-              mount -t ext4 /dev/$p /mnt 2>/dev/null && return 0
-              return 1
-          }
-          
-          try_all() {
-              # 覆盖 eMMC 和 U 盘可能的分区名
-              for p in sda2 sdb2 sdc2 sdd2 mmcblk2p2 mmcblk2p3; do
-                  [ -b /dev/$p ] || continue
-                  if try_mount $p; then ROOT=$p; return 0; fi
-              done
-              return 1
-          }
-          
-          try_all || { sleep 5; echo "[initramfs] 重试..."; try_all; }
-          
-          if [ -n "$ROOT" ] && [ -x /mnt/sbin/init ]; then
-              echo "[initramfs] 成功挂载根分区: /dev/$ROOT"
-              umount /proc /sys 2>/dev/null
-              exec switch_root /mnt /sbin/init
-          fi
-          echo "[initramfs] 未找到可用的根分区, 进入急救 Shell"
-          exec /bin/sh
-          EOF
+echo "========================================="
+echo "  N1 Custom Initramfs (Debug Enabled)    "
+echo "========================================="
+
+# 挂载基础文件系统
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+
+echo "[init] 加载存储与文件系统模块..."
+# 尝试加载模块 (如果内核已内置则忽略错误)
+for mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do
+    modprobe $mod 2>/dev/null && echo "  [+] Loaded: $mod" || echo "  [-] Skipped/Built-in: $mod"
+done
+
+echo "[init] 等待 USB 设备枚举 (sleep 5)..."
+sleep 5
+
+echo "[init] 当前块设备列表:"
+ls -l /dev/sd* /dev/mmcblk* 2>/dev/null || echo "  (未找到 sd/mmcblk 设备)"
+
+ROOT_DEV=""
+MOUNT_OPTS=""
+
+# 探测根分区函数
+find_root() {
+    # 优先通过 LABEL 查找 (ophub 默认标签通常是 ROOTFS)
+    if [ -x /bin/findfs ]; then
+        ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null)
+        if [ -n "$ROOT_DEV" ]; then
+            echo "[init] 通过 LABEL=ROOTFS 找到: $ROOT_DEV"
+            return 0
+        fi
+    fi
+
+    # 遍历所有可能的块设备
+    for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do
+        [ -b "$dev" ] || continue
+        echo "[init] 尝试挂载 $dev ..."
+        
+        # 尝试 Btrfs 子卷
+        if mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null; then
+            ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; return 0
+        fi
+        if mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null; then
+            ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; return 0
+        fi
+        # 尝试普通 Btrfs/Ext4
+        if mount -t btrfs -o ro "$dev" /mnt 2>/dev/null; then
+            ROOT_DEV="$dev"; return 0
+        fi
+        if mount -t ext4 -o ro "$dev" /mnt 2>/dev/null; then
+            ROOT_DEV="$dev"; return 0
+        fi
+    done
+    return 1
+}
+
+# 执行探测，如果失败则增加延时重试
+if ! find_root; then
+    echo "[init] 首次探测失败，等待 5 秒后重试..."
+    sleep 5
+    if ! find_root; then
+        echo "!!! [init] 致命错误: 无法挂载根分区 !!!"
+        echo "进入急救 Shell。请检查 U 盘是否插好，或输入 'ls /dev' 查看设备。"
+        exec /bin/sh
+    fi
+fi
+
+echo "[init] 成功挂载根分区: $ROOT_DEV (opts: $MOUNT_OPTS)"
+
+# 重新以读写模式挂载 (为 switch_root 准备)
+umount /mnt
+if [ -n "$MOUNT_OPTS" ]; then
+    mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt
+else
+    mount "$ROOT_DEV" /mnt
+fi
+
+if [ -x /mnt/sbin/init ]; then
+    echo "[init] 切换根目录 (switch_root)..."
+    # 卸载基础文件系统
+    umount /sys /proc /dev/pts /dev /tmp /run 2>/dev/null
+    exec switch_root /mnt /sbin/init
+fi
+
+echo "!!! [init] /mnt/sbin/init 不存在或不可执行 !!!"
+exec /bin/sh
+EOF
           chmod +x /tmp/initrd/init
           
           # 打包 initramfs
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
-          # === 自制 initramfs 制作结束 ===
+          # === Initramfs 结束 ===
 
           cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
           cd /tmp/rel
@@ -241,7 +311,7 @@ jobs:
           gh release delete kernel_stable --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create kernel_stable ${KV}.tar.gz \
             --repo ${{ github.repository }} \
-            -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
+            -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M (Fixed USB Boot)"
           
           rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src"
 
@@ -256,43 +326,43 @@ jobs:
             -exec cp {} "inject/etc/usb_modeswitch.d/1111:1111" \; 2>/dev/null || true
           
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
-          #!/bin/sh
-          [ "$ACTION" = "add" ] || exit 0
-          case "$PRODUCT" in
-              a69c:8d80*|a69c:8d83*)
-                  modprobe aic_load_fw 2>/dev/null ;;
-              a69c:8d81*|368b:8d81*)
-                  modprobe cfg80211 2>/dev/null
-                  modprobe aic8800_fdrv 2>/dev/null
-                  modprobe aic_zlp_quirk 2>/dev/null
-                  modprobe btusb 2>/dev/null ;;
-          esac
-          exit 0
-          EOF
+#!/bin/sh
+[ "$ACTION" = "add" ] || exit 0
+case "$PRODUCT" in
+    a69c:8d80*|a69c:8d83*)
+        modprobe aic_load_fw 2>/dev/null ;;
+    a69c:8d81*|368b:8d81*)
+        modprobe cfg80211 2>/dev/null
+        modprobe aic8800_fdrv 2>/dev/null
+        modprobe aic_zlp_quirk 2>/dev/null
+        modprobe btusb 2>/dev/null ;;
+esac
+exit 0
+EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
           cat > inject/etc/custom_service/start_service.sh <<'EOF'
-          #!/bin/sh
-          i=0
-          while [ $i -lt 40 ]; do
-              lsusb | grep -qiE 'a69c|368b' && break
-              if lsusb | grep -q "1111:1111"; then
-                  usb_modeswitch -v 0x1111 -p 0x1111 \
-                    -M 555342438765432100000000000010fd0000000000000000000000000000f3 \
-                    -M 555342438765432100000000000010fd0000000000000000000000000000f2 >/dev/null 2>&1
-              fi
-              sleep 3; i=$((i+3))
-          done
-          exit 0
-          EOF
+#!/bin/sh
+i=0
+while [ $i -lt 40 ]; do
+    lsusb | grep -qiE 'a69c|368b' && break
+    if lsusb | grep -q "1111:1111"; then
+        usb_modeswitch -v 0x1111 -p 0x1111 \
+          -M 555342438765432100000000000010fd0000000000000000000000000000f3 \
+          -M 555342438765432100000000000010fd0000000000000000000000000000f2 >/dev/null 2>&1
+    fi
+    sleep 3; i=$((i+3))
+done
+exit 0
+EOF
           chmod +x inject/etc/custom_service/start_service.sh
           
           cat > inject/etc/profile.d/30-sysinfo.sh <<'EOF'
-          #!/bin/sh
-          echo "==================================="
-          echo "  CPU 温度: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))°C"
-          echo "==================================="
-          EOF
+#!/bin/sh
+echo "==================================="
+echo "  CPU 温度: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))°C"
+echo "==================================="
+EOF
           rm -rf aicsrc
 
       - name: 准备中文语言包(离线注入)
@@ -304,6 +374,7 @@ jobs:
           download_ipk() {
             local sub="$1" pkg="$2" file
             file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip \
+
                    | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}' || true)
             case "$file" in */*) ;; *) file="${sub}/${file}" ;; esac
             if [ -n "$file" ]; then
@@ -315,15 +386,15 @@ jobs:
           download_ipk luci luci-i18n-mwan3-zh-cn
           
           cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
-          #!/bin/sh
-          opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
-          opkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null
-          for d in /usr/sbin /usr/bin /sbin /bin; do
-              cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null
-          done
-          uci set luci.main.lang='zh_cn' 2>/dev/null && uci commit luci 2>/dev/null
-          exit 0
-          EOF
+#!/bin/sh
+opkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null
+opkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null
+for d in /usr/sbin /usr/bin /sbin /bin; do
+    cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null
+done
+uci set luci.main.lang='zh_cn' 2>/dev/null && uci commit luci 2>/dev/null
+exit 0
+EOF
           chmod +x inject/etc/uci-defaults/99-zh-cn
 
       - name: 克隆 OpenWrt 源码
@@ -338,22 +409,22 @@ jobs:
         run: |
           cd openwrt
           cat > .config <<'EOF'
-          CONFIG_TARGET_armsr=y
-          CONFIG_TARGET_armsr_armv8=y
-          CONFIG_TARGET_ROOTFS_TARGZ=y
-          CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-          CONFIG_PACKAGE_wpad-mbedtls=y
-          CONFIG_PACKAGE_iw=y
-          CONFIG_PACKAGE_iwinfo=y
-          CONFIG_PACKAGE_bluez-daemon=y
-          CONFIG_PACKAGE_bluez-utils=y
-          CONFIG_PACKAGE_usb-modeswitch=y
-          CONFIG_PACKAGE_usbutils=y
-          CONFIG_PACKAGE_mwan3=y
-          CONFIG_PACKAGE_luci-app-mwan3=y
-          CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
-          EOF
+CONFIG_TARGET_armsr=y
+CONFIG_TARGET_armsr_armv8=y
+CONFIG_TARGET_ROOTFS_TARGZ=y
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+CONFIG_PACKAGE_wpad-mbedtls=y
+CONFIG_PACKAGE_iw=y
+CONFIG_PACKAGE_iwinfo=y
+CONFIG_PACKAGE_bluez-daemon=y
+CONFIG_PACKAGE_bluez-utils=y
+CONFIG_PACKAGE_usb-modeswitch=y
+CONFIG_PACKAGE_usbutils=y
+CONFIG_PACKAGE_mwan3=y
+CONFIG_PACKAGE_luci-app-mwan3=y
+CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
+EOF
           sed -i 's/^          //' .config
           make defconfig
 
@@ -369,16 +440,7 @@ jobs:
             make -j1 V=s 2>>"$ERR_FILE"
           fi
 
-      - name: 升级 coreutils
-        run: |
-          curl -fsSL https://ftp.gnu.org/gnu/coreutils/coreutils-9.9.tar.xz | tar xJ
-          cd coreutils-9.9
-          ./configure --quiet >/dev/null
-          make -j$(nproc) >/dev/null
-          sudo make install >/dev/null
-          hash -r
-
-      - name: 打包 N1 固件
+      - name: 打包 N1 固件 (注入自定义内核与 Initramfs)
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
           openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
@@ -387,6 +449,8 @@ jobs:
           openwrt_kernel: ${{ env.KV }}
           auto_kernel: false
           openwrt_files: inject
+          # 确保传递 rootwait，让内核等待 USB 设备就绪
+          openwrt_bootargs: "console=ttyAML0,115200n8 console=tty0 no_console_suspend consoleblank=0 fsck.fix=yes net.ifnames=0 macaddr=random rootwait"
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
