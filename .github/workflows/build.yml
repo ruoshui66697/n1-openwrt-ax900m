@@ -143,7 +143,9 @@ jobs:
           sed -i 's/^# CONFIG_BLKID is not set/CONFIG_BLKID=y/' .config
           sed -i 's/^# CONFIG_FINDFS is not set/CONFIG_FINDFS=y/' .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) 2>>"$ERR_FILE"
-          cp busybox "$OLDPWD/"
+          # ✅ 修复：使用 CONFIG_PREFIX 直接安装并生成符号链接，避免后续在 x86 主机执行 arm64 二进制
+          mkdir -p "$GITHUB_WORKSPACE/busybox-root"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_PREFIX="$GITHUB_WORKSPACE/busybox-root" install 2>>"$ERR_FILE"
 
       - name: 打包内核并发布 Release (重构 Initramfs - 修复 YAML 报错)
         env:
@@ -163,10 +165,11 @@ jobs:
                    /tmp/initrd/var /tmp/initrd/run /tmp/initrd/root /tmp/initrd/lib/modules \
                    /tmp/initrd/usr/bin /tmp/initrd/usr/sbin
           
-          cp "$GITHUB_WORKSPACE/busybox" /tmp/initrd/bin/busybox
+          # ✅ 修复：直接复制预先生成好符号链接的目录，不再执行 busybox --install
+          cp -a "$GITHUB_WORKSPACE/busybox-root/bin/." /tmp/initrd/bin/
+          cp -a "$GITHUB_WORKSPACE/busybox-root/sbin/." /tmp/initrd/sbin/ 2>/dev/null || true
           chmod +x /tmp/initrd/bin/busybox
-          /tmp/initrd/bin/busybox --install -s /tmp/initrd/bin
-          /tmp/initrd/bin/busybox --install -s /tmp/initrd/sbin
+          
           cp -r /tmp/kmod/lib/modules/$KREL /tmp/initrd/lib/modules/
 
           # 【核心修复】使用 printf 逐行写入 init 脚本，彻底避免 YAML Heredoc 解析错误
@@ -231,7 +234,7 @@ jobs:
             --repo ${{ github.repository }} \
             -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M (Fixed YAML)"
           
-          rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src"
+          rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src" "$GITHUB_WORKSPACE/busybox-root"
 
       - name: 组装注入包
         run: |
