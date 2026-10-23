@@ -1,0 +1,81 @@
+name: 极速验证打包流程
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: 初始化环境
+        run: |
+          mkdir -p openwrt/bin/targets/armsr/armv8
+          mkdir -p inject/opt/bin inject/etc/hotplug.d/usb inject/etc/uci-defaults
+          
+          # 1. 伪造一个假的 usb_modeswitch
+          echo "echo 'dummy'" > inject/opt/bin/usb_modeswitch
+          chmod +x inject/opt/bin/usb_modeswitch
+          
+          # 2. 伪造 hotplug 脚本
+          echo "echo 'dummy'" > inject/etc/hotplug.d/usb/99-aic8800
+          chmod +x inject/etc/hotplug.d/usb/99-aic8800
+          
+          # 3. 伪造 uci-defaults 脚本
+          echo "echo 'dummy'" > inject/etc/uci-defaults/99-zh-cn
+          chmod +x inject/etc/uci-defaults/99-zh-cn
+          
+          # 4. 从 OpenWrt 官方下载一个现成的 rootfs（仅用于测试打包，不需要自己编译）
+          echo "下载官方 rootfs..."
+          wget -q "https://downloads.openwrt.org/releases/24.10.2/targets/armsr/armv8/openwrt-24.10.2-armsr-armv8-generic-rootfs.tar.gz" -O openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz
+          
+          # 5. 伪造环境变量（因为打包脚本需要读取 KV）
+          echo "KV=6.12.999" >> $GITHUB_ENV
+
+      - name: 临时修复 cp --update 兼容性 Bug
+        run: |
+          sudo mv /usr/bin/cp /usr/bin/cp.orig
+          sudo tee /usr/bin/cp > /dev/null <<'EOF'
+          #!/bin/bash
+          args=()
+          for arg in "$@"; do
+            if [[ "$arg" == "--update" ]]; then
+              args+=("-n")
+            elif [[ "$arg" == --update=* ]]; then
+              args+=("-n")
+            else
+              args+=("$arg")
+            fi
+          done
+          exec /usr/bin/cp.orig "${args[@]}"
+          EOF
+          sudo chmod +x /usr/bin/cp
+
+      - name: 打包 N1 固件 (测试)
+        uses: ophub/amlogic-s9xxx-openwrt@main
+        with:
+          openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
+          openwrt_board: s905d
+          kernel_repo: ${{ github.repository }}
+          openwrt_kernel: ${{ env.KV }}
+          auto_kernel: false
+          openwrt_files: inject
+
+      - name: 恢复系统默认 cp 命令
+        if: always()
+        run: |
+          if [ -f /usr/bin/cp.orig ]; then
+            sudo mv /usr/bin/cp.orig /usr/bin/cp
+          fi
+
+      - name: 检查产物是否存在
+        run: |
+          echo "查找生成的固件..."
+          ls -lah ${{ env.PACKAGED_OUTPUTPATH }}/ || echo "目录不存在"
+          if ls ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz 1> /dev/null 2>&1; then
+            echo "✅ 验证成功！固件生成正常。"
+          else
+            echo "❌ 验证失败！未找到固件产物。"
+            exit 1
+          fi
