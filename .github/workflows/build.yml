@@ -89,6 +89,8 @@ jobs:
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
           cd ksrc-src
           KV="${{ env.KV }}"
+          
+          # 存储与文件系统
           scripts/config -e CONFIG_BLK_DEV_SD
           scripts/config -e CONFIG_BLK_DEV_SR
           scripts/config -e CONFIG_USB_STORAGE
@@ -100,9 +102,21 @@ jobs:
           scripts/config -e CONFIG_FAT_FS
           scripts/config -e CONFIG_VFAT_FS
           scripts/config -e CONFIG_NLS_UTF8
+          
+          # USB 控制器 (修复 HC died 崩溃)
           scripts/config -e CONFIG_USB_XHCI_HCD
           scripts/config -e CONFIG_USB_EHCI_HCD
           scripts/config -e CONFIG_USB_DWC3
+          scripts/config -e CONFIG_USB_DWC3_MESON_GXL
+          scripts/config -e CONFIG_USB_XHCI_PLATFORM
+          
+          # N1 有线网卡 (修复 Cannot attach to PHY)
+          scripts/config -e CONFIG_NET_VENDOR_REALTEK
+          scripts/config -e CONFIG_REALTEK_PHY
+          scripts/config -e CONFIG_MDIO_BUS_MUX_MESON_GXL
+          scripts/config -e CONFIG_DWMAC_MESON
+          scripts/config -e CONFIG_STMMAC_ETH
+          
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           V=$(awk '/^VERSION = /{print $3}' Makefile)
           P=$(awk '/^PATCHLEVEL = /{print $3}' Makefile)
@@ -110,8 +124,10 @@ jobs:
           KREL="${V}.${P}.${S}"
           echo "KREL=${KREL}" >> $GITHUB_ENV
           test "$KREL" = "$KV" || { log_err "KREL($KREL) 与 flippy KV($KV) 不一致"; exit 1; }
+          
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs 2>>"$ERR_FILE"
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=/tmp/kmod INSTALL_MOD_STRIP=1 KERNELRELEASE="${KREL}" DEPMOD=true modules_install
+          
           mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules 2>>"$ERR_FILE"
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
