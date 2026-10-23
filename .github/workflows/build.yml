@@ -169,15 +169,19 @@ jobs:
           cp -a "$GITHUB_WORKSPACE/busybox-root/bin/." /tmp/initrd/bin/
           cp -a "$GITHUB_WORKSPACE/busybox-root/sbin/." /tmp/initrd/sbin/ 2>/dev/null || true
           chmod +x /tmp/initrd/bin/busybox
+          
           mkdir -p /tmp/initrd/lib/modules/${KREL}
           cp /tmp/kmod/lib/modules/${KREL}/modules.* /tmp/initrd/lib/modules/${KREL}/ 2>/dev/null || true
           MOD_SRC="/tmp/kmod/lib/modules/${KREL}/kernel"
           MOD_DST="/tmp/initrd/lib/modules/${KREL}/kernel"
-          mkdir -p "$MOD_DST/fs/btrfs" "$MOD_DST/fs/ext4" "$MOD_DST/drivers/usb/storage" "$MOD_DST/drivers/scsi"
-          find "$MOD_SRC/fs/btrfs" -name '*.ko' -exec cp {} "$MOD_DST/fs/btrfs/" \;
-          find "$MOD_SRC/fs/ext4" -name '*.ko' -exec cp {} "$MOD_DST/fs/ext4/" \;
-          find "$MOD_SRC/drivers/usb/storage" -name '*.ko' -exec cp {} "$MOD_DST/drivers/usb/storage/" \;
-          find "$MOD_SRC/drivers/scsi" -name '*.ko' -exec cp {} "$MOD_DST/drivers/scsi/" \;
+          mkdir -p "$MOD_DST"
+          
+          # 【修复核心】增加目录判断：如果驱动已强制内置进内核（即不存在 .ko），则跳过拷贝，避免 find 报错中断
+          [ -d "$MOD_SRC/fs/btrfs" ] && mkdir -p "$MOD_DST/fs/btrfs" && find "$MOD_SRC/fs/btrfs" -name '*.ko' -exec cp {} "$MOD_DST/fs/btrfs/" \;
+          [ -d "$MOD_SRC/fs/ext4" ] && mkdir -p "$MOD_DST/fs/ext4" && find "$MOD_SRC/fs/ext4" -name '*.ko' -exec cp {} "$MOD_DST/fs/ext4/" \;
+          [ -d "$MOD_SRC/drivers/usb/storage" ] && mkdir -p "$MOD_DST/drivers/usb/storage" && find "$MOD_SRC/drivers/usb/storage" -name '*.ko' -exec cp {} "$MOD_DST/drivers/usb/storage/" \;
+          [ -d "$MOD_SRC/drivers/scsi" ] && mkdir -p "$MOD_DST/drivers/scsi" && find "$MOD_SRC/drivers/scsi" -name '*.ko' -exec cp {} "$MOD_DST/drivers/scsi/" \;
+          
           printf '#!/bin/sh\nexec >/dev/console 2>&1\nexport PATH=/bin:/sbin\necho "=== N1 Custom Initramfs ==="\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmkdir -p /dev/pts /dev/shm\nmount -t devpts devpts /dev/pts\nmount -t tmpfs tmpfs /tmp\nmount -t tmpfs tmpfs /run\necho "[init] Loading storage modules..."\nfor mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do modprobe $mod 2>/dev/null; done\necho "[init] Waiting for USB (5s)..."\nsleep 5\nROOT_DEV=""\nMOUNT_OPTS=""\nfind_root() {\n    if [ -x /bin/findfs ]; then ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null); [ -n "$ROOT_DEV" ] && return 0; fi\n    for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do\n        [ -b "$dev" ] || continue\n        mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t ext4 -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n    done\n    return 1\n}\nif ! find_root; then sleep 5; if ! find_root; then echo "!!! FATAL: Cannot mount rootfs !!!"; exec /bin/sh; fi; fi\necho "[init] Root found: $ROOT_DEV"\numount -l /mnt 2>/dev/null || umount /mnt 2>/dev/null || true\n[ -n "$MOUNT_OPTS" ] && mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt\nif [ -x /mnt/sbin/init ]; then\n    umount /dev/pts 2>/dev/null || true\n    umount /dev 2>/dev/null || true\n    umount /sys 2>/dev/null || true\n    umount /proc 2>/dev/null || true\n    umount /tmp 2>/dev/null || true\n    umount /run 2>/dev/null || true\n    exec switch_root /mnt /sbin/init\nfi\necho "!!! /mnt/sbin/init missing !!!"; exec /bin/sh\n' > /tmp/initrd/init
           chmod +x /tmp/initrd/init
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
@@ -287,9 +291,13 @@ jobs:
 
       - name: 构建结果推送到钉钉
         if: always()
+        env:
+          DINGTALK_TOKEN: ${{ secrets.DINGTALK_TOKEN }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           ERR_FILE="$GITHUB_WORKSPACE/error_log.txt"
+          
           if [ "${{ job.status }}" = "success" ]; then
             TITLE="[openwrt N1] ✅ 构建成功"
             CONTENT="固件已编译完成，去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
@@ -303,5 +311,22 @@ jobs:
               CONTENT="请到 Actions 查看失败步骤日志。"
             fi
           fi
+          
           PAYLOAD=$(jq -n --arg title "$TITLE" --arg content "$CONTENT" --arg url "$RUN_URL" '{msgtype:"text", text:{content: ($title + "\n" + $content + "\n" + $url)}}')
-          curl -sS -X POST "https://oapi.dingtalk.com/robot/send?access_token=${{ secrets.DINGTALK_TOKEN }}" -H "Content-Type: application/json" -d "$PAYLOAD" || true
+          
+          if [ -n "$DINGTALK_SECRET" ]; then
+            TIMESTAMP=$(date +%s000)
+            STRING_TO_SIGN="${TIMESTAMP}\n${DINGTALK_SECRET}"
+            SIGN=$(echo -n "$STRING_TO_SIGN" | openssl dgst -sha256 -hmac "$DINGTALK_SECRET" -binary | base64 | sed 's/+/%20/g;s/\//%2F/g;s/=/%3D/g')
+            WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}&timestamp=${TIMESTAMP}&sign=${SIGN}"
+          else
+            WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}"
+          fi
+
+          RESPONSE=$(curl -sS -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD")
+          echo "钉钉接口返回: $RESPONSE"
+          if echo "$RESPONSE" | grep -q '"errcode":0'; then
+            echo "✅ 钉钉通知发送成功"
+          else
+            echo "❌ 钉钉通知发送失败"
+          fi
