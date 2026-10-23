@@ -9,28 +9,31 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 初始化环境
+      - name: 初始化环境 (本地造假包，免下载)
         run: |
           mkdir -p openwrt/bin/targets/armsr/armv8
           mkdir -p inject/opt/bin inject/etc/hotplug.d/usb inject/etc/uci-defaults
           
-          # 1. 伪造一个假的 usb_modeswitch
+          # 1. 伪造注入文件
           echo "echo 'dummy'" > inject/opt/bin/usb_modeswitch
           chmod +x inject/opt/bin/usb_modeswitch
-          
-          # 2. 伪造 hotplug 脚本
           echo "echo 'dummy'" > inject/etc/hotplug.d/usb/99-aic8800
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
-          
-          # 3. 伪造 uci-defaults 脚本
           echo "echo 'dummy'" > inject/etc/uci-defaults/99-zh-cn
           chmod +x inject/etc/uci-defaults/99-zh-cn
           
-          # 4. 从 OpenWrt 官方下载一个现成的 rootfs（这里使用官方正式发布的 23.05.5 版本）
-          echo "下载官方 rootfs..."
-          wget -q "https://downloads.openwrt.org/releases/23.05.5/targets/armsr/armv8/openwrt-23.05.5-armsr-armv8-generic-rootfs.tar.gz" -O openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz
+          # 2. 伪造一个极简的 rootfs 目录结构
+          mkdir -p fake_rootfs
+          mkdir -p fake_rootfs/bin fake_rootfs/sbin fake_rootfs/etc fake_rootfs/lib fake_rootfs/usr fake_rootfs/www
+          echo "#!/bin/sh" > fake_rootfs/sbin/init
+          chmod +x fake_rootfs/sbin/init
+          echo "OpenWrt" > fake_rootfs/etc/openwrt_release
           
-          # 5. 伪造环境变量（因为打包脚本需要读取 KV）
+          # 3. 打包成 tar.gz 伪装成编译好的 OpenWrt rootfs
+          echo "生成假 rootfs.tar.gz..."
+          tar czf openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz -C fake_rootfs .
+          
+          # 4. 伪造环境变量
           echo "KV=6.12.999" >> $GITHUB_ENV
 
       - name: 临时修复 cp --update 兼容性 Bug
