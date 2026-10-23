@@ -138,7 +138,9 @@ jobs:
 
       - name: 编译 busybox 静态二进制
         run: |
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /tmp
+          # 使用 GitHub Releases 镜像替代被封锁的 musl.cc
+          wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
+          tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
           export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
           curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
           cd /tmp/busybox-1.36.1
