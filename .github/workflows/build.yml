@@ -138,7 +138,6 @@ jobs:
 
       - name: 编译 busybox 静态二进制
         run: |
-          # 使用 GitHub Releases 镜像替代被封锁的 musl.cc
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
           tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
           export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
@@ -176,7 +175,6 @@ jobs:
           MOD_DST="/tmp/initrd/lib/modules/${KREL}/kernel"
           mkdir -p "$MOD_DST"
           
-          # 【修复核心】增加目录判断：如果驱动已强制内置进内核（即不存在 .ko），则跳过拷贝，避免 find 报错中断
           [ -d "$MOD_SRC/fs/btrfs" ] && mkdir -p "$MOD_DST/fs/btrfs" && find "$MOD_SRC/fs/btrfs" -name '*.ko' -exec cp {} "$MOD_DST/fs/btrfs/" \;
           [ -d "$MOD_SRC/fs/ext4" ] && mkdir -p "$MOD_DST/fs/ext4" && find "$MOD_SRC/fs/ext4" -name '*.ko' -exec cp {} "$MOD_DST/fs/ext4/" \;
           [ -d "$MOD_SRC/drivers/usb/storage" ] && mkdir -p "$MOD_DST/drivers/usb/storage" && find "$MOD_SRC/drivers/usb/storage" -name '*.ko' -exec cp {} "$MOD_DST/drivers/usb/storage/" \;
@@ -262,6 +260,26 @@ jobs:
             exit 1
           fi
 
+      # ================= 核心修复区 =================
+      - name: 临时修复 cp --update 兼容性 Bug
+        run: |
+          sudo mv /usr/bin/cp /usr/bin/cp.orig
+          sudo tee /usr/bin/cp > /dev/null <<'EOF'
+          #!/bin/bash
+          args=()
+          for arg in "$@"; do
+            if [[ "$arg" == "--update" ]]; then
+              args+=("-n")
+            elif [[ "$arg" == --update=* ]]; then
+              args+=("-n")
+            else
+              args+=("$arg")
+            fi
+          done
+          exec /usr/bin/cp.orig "${args[@]}"
+          EOF
+          sudo chmod +x /usr/bin/cp
+
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
@@ -271,7 +289,14 @@ jobs:
           openwrt_kernel: ${{ env.KV }}
           auto_kernel: false
           openwrt_files: inject
-          # 移除了 openwrt_bootargs，使用 Action 内部默认的启动参数
+
+      - name: 恢复系统默认 cp 命令
+        if: always()
+        run: |
+          if [ -f /usr/bin/cp.orig ]; then
+            sudo mv /usr/bin/cp.orig /usr/bin/cp
+          fi
+      # ================= 核心修复区 =================
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
