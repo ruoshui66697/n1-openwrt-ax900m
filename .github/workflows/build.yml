@@ -42,6 +42,16 @@ jobs:
             zstd lz4 u-boot-tools cpio dosfstools \
             libtool pkg-config autoconf automake jq
 
+      - name: 缓存 OpenWrt 源码包
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir
+          key: n1-openwrt-${{ github.event.inputs.openwrt_version }}-${{ github.run_id }}
+          restore-keys: |
+            n1-openwrt-${{ github.event.inputs.openwrt_version }}-
+
       - name: 查询 flippy 内核版本并获取内核配置
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
@@ -62,6 +72,13 @@ jobs:
       - name: 准备内核源码与 AX900M 驱动源码
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
+          
+          # 前置验证驱动分支是否存在
+          if ! git ls-remote --heads https://github.com/shenmintao/aic8800d80.git | grep -q "refs/heads/${{ github.event.inputs.driver_branch }}"; then
+            log_err "驱动分支 ${{ github.event.inputs.driver_branch }} 不存在，请检查输入！"
+            exit 1
+          fi
+
           rm -rf ksrc-src
           git clone --depth 100 https://github.com/unifreq/linux-6.12.y.git ksrc-src
           cd ksrc-src
@@ -92,6 +109,7 @@ jobs:
           
           scripts/config -e CONFIG_BLK_DEV_SD
           scripts/config -e CONFIG_BLK_DEV_SR
+          # P2: 确认编译进内核 (=y)
           scripts/config -e CONFIG_USB_STORAGE
           scripts/config -e CONFIG_USB_UAS
           scripts/config -e CONFIG_SCSI_MOD
@@ -129,33 +147,6 @@ jobs:
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules 2>>"$ERR_FILE"
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
           depmod -b /tmp/kmod ${KREL}
-
-      - name: 编译 usb_modeswitch 静态二进制 (修复 libusb 死锁)
-        run: |
-          log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
-          tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
-          export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
-          
-          # 【核心修复 1】退回最稳定的 libusb 1.0.26 版本，避开 1.0.27 在 6.12 上的 Bug
-          git clone --depth 1 --branch v1.0.26 https://github.com/libusb/libusb.git libusb-src || true
-          if [ -d libusb-src ]; then
-            cd libusb-src
-            # 强制关闭 udev 依赖，纯手工探测 USB 接口
-            ./autogen.sh --host=aarch64-linux-musl --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
-            make -j$(nproc) >/dev/null && make install >/dev/null
-            cd ..
-          else
-            log_err "libusb 克隆失败"; exit 1
-          fi
-          
-          curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
-          tar xjf /tmp/ums.tar.bz2 -C /tmp
-          cd /tmp/usb-modeswitch-2.6.1
-          aarch64-linux-musl-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c \
-            -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
-          test -x usb_modeswitch || { log_err "usb_modeswitch 编译失败"; exit 1; }
-          cp usb_modeswitch "$OLDPWD/"
 
       - name: 编译 busybox 静态二进制
         run: |
@@ -217,15 +208,16 @@ jobs:
           cd wrap/${KV} && sha256sum *.tar.gz > sha256sums
           cd .. && tar czf ${KV}.tar.gz ${KV}
           test -f "${KV}.tar.gz" || { echo "Release 资产缺失"; exit 1; }
-          gh release delete kernel_stable --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
-          gh release create kernel_stable ${KV}.tar.gz --repo ${{ github.repository }} -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
-          rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/libusb-src" "$GITHUB_WORKSPACE/busybox-root" /tmp/aarch64-linux-musl-cross
+          
+          # 【优化】Release 标签加入 Run ID 防止冲突
+          RELEASE_TAG="kernel-${KV}-${{ github.run_number }}"
+          gh release delete "$RELEASE_TAG" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
+          gh release create "$RELEASE_TAG" ${KV}.tar.gz --repo ${{ github.repository }} -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
+          rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/busybox-root" /tmp/aarch64-linux-musl-cross
 
       - name: 组装注入包
         run: |
-          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d
-          test -f usb_modeswitch || { echo "usb_modeswitch 缺失"; exit 1; }
-          cp usb_modeswitch inject/usr/sbin/
+          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           
           # 写入官方正确的配置
@@ -237,21 +229,66 @@ jobs:
           MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
           EOF
 
-          # 【核心修复 2】热插拔脚本：先解绑 usb-storage 释放控制权，再用 -D -R 参数强行切换
-          printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    1111/1111*)\n        sleep 1\n        DEVPATH=$(echo "$DEVPATH" | sed "s/\\/devices//")\n        if [ -d "/sys/bus/usb/drivers/usb-storage/$DEVPATH:1.0" ]; then\n            echo -n "$DEVPATH:1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null\n        fi\n        /usr/sbin/usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n        ;;\n    a69c/8d80*|a69c/8d83*)\n        modprobe aic_load_fw 2>/dev/null ;;\n    a69c/8d81*|368b/8d81*)\n        modprobe cfg80211 2>/dev/null; modprobe aic8800_fdrv 2>/dev/null; modprobe aic_zlp_quirk 2>/dev/null; modprobe btusb 2>/dev/null ;;\nesac\nexit 0\n' > inject/etc/hotplug.d/usb/99-aic8800
+          # 【P1 核心修复】使用 heredoc 重写热插拔脚本
+          cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
+          #!/bin/sh
+          [ "$ACTION" = "add" ] || exit 0
+          case "$PRODUCT" in
+              1111/1111*)
+                  sleep 1
+                  DEVPATH=$(echo "$DEVPATH" | sed "s/\/devices//")
+                  if [ -d "/sys/bus/usb/drivers/usb-storage/$DEVPATH:1.0" ]; then
+                      echo -n "$DEVPATH:1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
+                  fi
+                  usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1
+                  ;;
+              a69c/8d80*|a69c/8d83*)
+                  modprobe aic_load_fw 2>/dev/null
+                  ;;
+              a69c/8d81*|368b/8d81*)
+                  modprobe cfg80211 2>/dev/null
+                  modprobe aic8800_fdrv 2>/dev/null
+                  modprobe aic_zlp_quirk 2>/dev/null
+                  modprobe btusb 2>/dev/null
+                  ;;
+          esac
+          exit 0
+          EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          # 【核心修复 3】开机脚本：同样加入解绑和 -D -R 参数，防止冷启动被锁
-          printf '#!/bin/sh\ni=0\nwhile [ $i -lt 20 ]; do\n    if lsusb 2>/dev/null | grep -qiE "a69c|368b"; then\n        modprobe cfg80211 2>/dev/null\n        modprobe aic_load_fw 2>/dev/null\n        modprobe aic8800_fdrv 2>/dev/null\n        break\n    fi\n    if lsusb 2>/dev/null | grep -q "1111:1111"; then\n        for dev in /sys/bus/usb/devices/1-*; do\n            if [ -d "$dev" ] && [ -d "/sys/bus/usb/drivers/usb-storage/$(basename $dev):1.0" ]; then\n                echo -n "$(basename $dev):1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null\n            fi\n        done\n        usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n    fi\n    sleep 3\n    i=$((i+3))\ndone\nexit 0\n' > inject/etc/rc.local
+          # 【优化】重写开机脚本，彻底抛弃 lsusb，改用 sysfs 检测
+          cat > inject/etc/rc.local <<'EOF'
+          #!/bin/sh
+          i=0
+          while [ $i -lt 20 ]; do
+              if cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | grep -qiE "a69c|368b"; then
+                  modprobe cfg80211 2>/dev/null
+                  modprobe aic_load_fw 2>/dev/null
+                  modprobe aic8800_fdrv 2>/dev/null
+                  break
+              fi
+              if cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | grep -q "1111"; then
+                  for dev in /sys/bus/usb/devices/1-*; do
+                      if [ -d "$dev" ] && [ -d "/sys/bus/usb/drivers/usb-storage/$(basename $dev):1.0" ]; then
+                          echo -n "$(basename $dev):1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
+                      fi
+                  done
+                  usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1
+              fi
+              sleep 3
+              i=$((i+3))
+          done
+          exit 0
+          EOF
           chmod +x inject/etc/rc.local
           
           printf '#!/bin/sh\necho "==================================="\necho "  CPU Temp: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 )) C"\necho "==================================="\n' > inject/etc/profile.d/30-sysinfo.sh
           chmod +x inject/etc/profile.d/30-sysinfo.sh
           rm -rf aicsrc
 
-      - name: 准备中文语言包与默认网络
+      - name: 准备中文、默认网络与动态版驱动
         run: |
-          mkdir -p inject/opt/ipks inject/etc/uci-defaults
+          mkdir -p inject/opt/ipks
           REL="${{ github.event.inputs.openwrt_version }}"
           REL="${REL#v}"
           REPO="https://downloads.openwrt.org/releases/${REL}/packages/aarch64_generic"
@@ -264,6 +301,19 @@ jobs:
           download_ipk luci luci-i18n-base-zh-cn
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
+          
+          # 【P0 & P3 核心修复】直接下载官方原版动态库和工具
+          echo ">>> 正在下载官方原生动态版 libusb 和 usb_modeswitch..."
+          curl -fsSL "https://downloads.openwrt.org/releases/23.05.5/packages/aarch64_cortex-a53/base/libusb-1.0-0_1.0.26-3_aarch64_cortex-a53.ipk" -o /tmp/libusb.ipk
+          curl -fsSL "https://downloads.openwrt.org/releases/23.05.5/packages/aarch64_cortex-a53/base/usb-modeswitch_2022-02-24-3c8595a4-1_aarch64_cortex-a53.ipk" -o /tmp/usbmode.ipk
+          
+          mkdir -p /tmp/usbex /tmp/umsx
+          tar -xzf /tmp/libusb.ipk -C /tmp/usbex; tar -xzf /tmp/usbex/data.tar.gz -C /tmp/usbex
+          tar -xzf /tmp/usbmode.ipk -C /tmp/umsx; tar -xzf /tmp/umsx/data.tar.gz -C /tmp/umsx
+          
+          mkdir -p inject/usr/lib inject/usr/sbin
+          cp -a /tmp/usbex/usr/lib/libusb-1.0.so* inject/usr/lib/ 2>/dev/null || true
+          cp -a /tmp/umsx/usr/sbin/usb_modeswitch inject/usr/sbin/ 2>/dev/null || true
           
           # 中文语言设置
           printf '#!/bin/sh\nopkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nopkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nuci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null\nexit 0\n' > inject/etc/uci-defaults/99-zh-cn
@@ -338,7 +388,8 @@ jobs:
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: N1-OpenWrt-AX900M
+          # 【优化】产物命名带版本号
+          name: N1-OpenWrt-AX900M-${{ env.KV }}-${{ github.run_number }}
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
 
@@ -346,8 +397,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-error-log
-          path: ${{ github.workspace }}/error_log.txt
+          name: build-error-log-${{ github.run_number }}
+          # 【优化】同时上传 openwrt/logs/ 目录
+          path: |
+            ${{ github.workspace }}/error_log.txt
+            openwrt/logs/
           retention-days: 7
           if-no-files-found: ignore
 
