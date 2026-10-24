@@ -123,7 +123,30 @@ jobs:
           scripts/config -e CONFIG_DWMAC_MESON
           scripts/config -e CONFIG_STMMAC_ETH
           
+          # 【核心修复 1】强制内置无线核心依赖
+          scripts/config -y CONFIG_WIRELESS
+          scripts/config -y CONFIG_CFG80211
+          scripts/config -m CONFIG_CFG80211_WEXT
+          scripts/config -y CONFIG_MAC80211
+          scripts/config -y CONFIG_RFKILL
+          
+          # 【核心修复 2】强制启用 USB DeviceFS
+          scripts/config -y CONFIG_USB_DEVICEFS
+          scripts/config -y CONFIG_USB_ANNOUNCE_NEW_DEVICES
+          
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          
+          # 【新增】编译前强制验证关键选项
+          echo ">>> 验证内核配置..."
+          for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_USB_DEVICEFS; do
+            VAL=$(grep "^${opt}=" .config | head -1)
+            echo "  $VAL"
+            if echo "$VAL" | grep -q "is not set"; then
+              log_err "${opt} 未生效！请检查依赖冲突"
+              exit 1
+            fi
+          done
+          
           V=$(awk '/^VERSION = /{print $3}' Makefile)
           P=$(awk '/^PATCHLEVEL = /{print $3}' Makefile)
           S=$(awk '/^SUBLEVEL = /{print $3}' Makefile)
@@ -147,9 +170,6 @@ jobs:
               if [ "$ACTUAL_SHA256" != "$BUSYBOX_TOOLCHAIN_SHA256" ]; then
                   echo "❌ 工具链 SHA256 校验失败！"; exit 1
               fi
-              echo "✅ 工具链校验通过"
-          else
-              echo "⚠️ 未设置 BUSYBOX_TOOLCHAIN_SHA256，跳过完整性校验"
           fi
           
           tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
@@ -193,8 +213,80 @@ jobs:
           [ -d "$MOD_SRC/drivers/usb/storage" ] && mkdir -p "$MOD_DST/drivers/usb/storage" && find "$MOD_SRC/drivers/usb/storage" -name '*.ko' -exec cp {} "$MOD_DST/drivers/usb/storage/" \;
           [ -d "$MOD_SRC/drivers/scsi" ] && mkdir -p "$MOD_DST/drivers/scsi" && find "$MOD_SRC/drivers/scsi" -name '*.ko' -exec cp {} "$MOD_DST/drivers/scsi/" \;
           
-          printf '#!/bin/sh\nexec >/dev/console 2>&1\nexport PATH=/bin:/sbin\necho "=== N1 Custom Initramfs ==="\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmkdir -p /dev/pts /dev/shm\nmount -t devpts devpts /dev/pts\nmount -t tmpfs tmpfs /tmp\nmount -t tmpfs tmpfs /run\necho "[init] Loading storage modules..."\nfor mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do modprobe $mod 2>/dev/null; done\necho "[init] Waiting for USB storage devices (max 15s)..."\ni=0\nwhile [ $i -lt 15 ]; do\n    FOUND=""\n    for d in /dev/sda1 /dev/sda2 /dev/sdb1 /dev/sdb2 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2; do\n        [ -b "$d" ] && { FOUND=1; break; }\n    done\n    [ -n "$FOUND" ] && break\n    sleep 1\n    i=$((i+1))\ndone\necho "[init] Device probe finished after ${i}s"\nROOT_DEV=""\nMOUNT_OPTS=""\nfind_root() {\n    if [ -x /bin/findfs ]; then ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null); [ -n "$ROOT_DEV" ] && return 0; fi\n    for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do\n        [ -b "$dev" ] || continue\n        mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t ext4 -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n    done\n    return 1\n}\nif ! find_root; then sleep 5; if ! find_root; then echo "!!! FATAL: Cannot mount rootfs !!!"; exec /bin/sh; fi; fi\necho "[init] Root found: $ROOT_DEV"\numount -l /mnt 2>/dev/null || umount /mnt 2>/dev/null || true\n[ -n "$MOUNT_OPTS" ] && mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt\nif [ -x /mnt/sbin/init ]; then\n    umount /dev/pts 2>/dev/null || true\n    umount /dev 2>/dev/null || true\n    umount /sys 2>/dev/null || true\n    umount /proc 2>/dev/null || true\n    umount /tmp 2>/dev/null || true\n    umount /run 2>/dev/null || true\n    exec switch_root /mnt /sbin/init\nfi\necho "!!! /mnt/sbin/init missing !!!"; exec /bin/sh\n' > /tmp/initrd/init
+          # 【优化】使用 heredoc 提升可读性，并在 switch_root 前卸载 usbfs
+          cat > /tmp/initrd/init <<'INITSCRIPT'
+          #!/bin/sh
+          exec >/dev/console 2>&1
+          export PATH=/bin:/sbin
+          echo "=== N1 Custom Initramfs ==="
+          mount -t devtmpfs devtmpfs /dev
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mkdir -p /dev/pts /dev/shm
+          mount -t devpts devpts /dev/pts
+          mount -t tmpfs tmpfs /tmp
+          mount -t tmpfs tmpfs /run
+          mkdir -p /proc/bus/usb /dev/bus/usb
+          mount -t usbfs usbfs /proc/bus/usb 2>/dev/null || true
+          mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null || true
+          echo "[init] Loading storage modules..."
+          for mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do
+              modprobe $mod 2>/dev/null
+          done
+          echo "[init] Waiting for USB storage devices (max 15s)..."
+          i=0
+          while [ $i -lt 15 ]; do
+              FOUND=""
+              for d in /dev/sda1 /dev/sda2 /dev/sdb1 /dev/sdb2 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2; do
+                  [ -b "$d" ] && { FOUND=1; break; }
+              done
+              [ -n "$FOUND" ] && break
+              sleep 1
+              i=$((i+1))
+          done
+          echo "[init] Device probe finished after ${i}s"
+          ROOT_DEV=""
+          MOUNT_OPTS=""
+          find_root() {
+              if [ -x /bin/findfs ]; then
+                  ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null)
+                  [ -n "$ROOT_DEV" ] && return 0
+              fi
+              for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do
+                  [ -b "$dev" ] || continue
+                  mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
+                  mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
+                  mount -t btrfs -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
+                  mount -t ext4 -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
+              done
+              return 1
+          }
+          if ! find_root; then
+              sleep 5
+              if ! find_root; then
+                  echo "!!! FATAL: Cannot mount rootfs !!!"
+                  exec /bin/sh
+              fi
+          fi
+          echo "[init] Root found: $ROOT_DEV"
+          umount -l /mnt 2>/dev/null || umount /mnt 2>/dev/null || true
+          [ -n "$MOUNT_OPTS" ] && mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt
+          if [ -x /mnt/sbin/init ]; then
+              umount /dev/pts 2>/dev/null || true
+              umount /dev 2>/dev/null || true
+              umount /sys 2>/dev/null || true
+              umount /proc 2>/dev/null || true
+              umount /tmp 2>/dev/null || true
+              umount /run 2>/dev/null || true
+              umount /proc/bus/usb 2>/dev/null || true
+              umount /dev/bus/usb 2>/dev/null || true
+              exec switch_root /mnt /sbin/init
+          fi
+          echo "!!! /mnt/sbin/init missing !!!"
+          exec /bin/sh
+          INITSCRIPT
           chmod +x /tmp/initrd/init
+          
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
           cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
@@ -227,16 +319,18 @@ jobs:
 
       - name: 组装注入包
         run: |
-          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults
+          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           
-          cat > inject/etc/usb_modeswitch.d/1111:1111 <<'EOF'
-          DefaultVendor=0x1111
-          DefaultProduct=0x1111
-          TargetVendor=0xa69c
-          TargetProduct=0x8d80
-          MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
+          cat > inject/usr/sbin/switch_card.sh <<'EOF'
+          #!/bin/sh
+          dev="$1"
+          if [ -b "$dev" ]; then
+              blockdev --setrw "$dev" 2>/dev/null
+              echo -ne "\x55\x53\x42\x43\x12\x34\x56\x78\x00\x00\x00\x00\x00\x00\x10\xfd\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf2" | dd of="$dev" bs=31 count=1 2>/dev/null
+          fi
           EOF
+          chmod +x inject/usr/sbin/switch_card.sh
 
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
@@ -244,17 +338,15 @@ jobs:
           case "$PRODUCT" in
               1111/1111*)
                   sleep 1
-                  DEVPATH=$(echo "$DEVPATH" | sed "s/\/devices//")
-                  if [ -d "/sys/bus/usb/drivers/usb-storage/$DEVPATH:1.0" ]; then
-                      echo -n "$DEVPATH:1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
+                  DEVNAME=$(ls /sys$DEVPATH/host*/target*/*/block/ 2>/dev/null | head -n 1)
+                  if [ -n "$DEVNAME" ]; then
+                      /usr/sbin/switch_card.sh "/dev/$DEVNAME"
                   fi
-                  usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1
                   ;;
               a69c/8d80*|a69c/8d83*)
                   modprobe aic_load_fw 2>/dev/null
                   ;;
               a69c/8d81*|368b/8d81*)
-                  modprobe cfg80211 2>/dev/null
                   modprobe aic8800_fdrv 2>/dev/null
                   modprobe aic_zlp_quirk 2>/dev/null
                   modprobe btusb 2>/dev/null
@@ -269,18 +361,14 @@ jobs:
           i=0
           while [ $i -lt 20 ]; do
               if cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | grep -qiE "a69c|368b"; then
-                  modprobe cfg80211 2>/dev/null
                   modprobe aic_load_fw 2>/dev/null
                   modprobe aic8800_fdrv 2>/dev/null
                   break
               fi
               if cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | grep -q "1111"; then
-                  for dev in /sys/bus/usb/devices/1-*; do
-                      if [ -d "$dev" ] && [ -d "/sys/bus/usb/drivers/usb-storage/$(basename $dev):1.0" ]; then
-                          echo -n "$(basename $dev):1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
-                      fi
+                  for sd in /dev/sdb /dev/sdc /dev/sdd; do
+                      [ -b "$sd" ] && /usr/sbin/switch_card.sh "$sd"
                   done
-                  usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1
               fi
               sleep 3
               i=$((i+3))
@@ -291,50 +379,38 @@ jobs:
           
           printf '#!/bin/sh\necho "==================================="\necho "  CPU Temp: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 )) C"\necho "==================================="\n' > inject/etc/profile.d/30-sysinfo.sh
           chmod +x inject/etc/profile.d/30-sysinfo.sh
-          rm -rf aicsrc
-
-      - name: 准备默认网络与动态版驱动
-        run: |
-          REL="${{ github.event.inputs.openwrt_version }}"
-          REL="${REL#v}"
           
-          ARCH="aarch64_generic"
-          REPO="https://downloads.openwrt.org/releases/${REL}/packages/${ARCH}"
+          cat > inject/etc/init.d/usbfs <<'EOF'
+          #!/bin/sh /etc/rc.common
+          START=10
+          start() {
+              mkdir -p /proc/bus/usb /dev/bus/usb
+              mountpoint -q /proc/bus/usb || mount -t usbfs usbfs /proc/bus/usb 2>/dev/null
+              [ -d /dev/bus/usb ] || mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null
+          }
+          EOF
+          chmod +x inject/etc/init.d/usbfs
           
-          echo ">>> 正在动态解析对应版本 (${REL}) 的 libusb 和 usb_modeswitch 依赖..."
-          LIBUSB_FILE=$(curl -fsSL "${REPO}/base/Packages.gz" | gunzip | awk '$1=="Filename:" && $2 ~ /libusb-1.0-0_/ {print $2; exit}')
-          USBMS_FILE=$(curl -fsSL "${REPO}/base/Packages.gz" | gunzip | awk '$1=="Filename:" && $2 ~ /usb-modeswitch_/ {print $2; exit}')
-          
-          if [ -n "$LIBUSB_FILE" ] && [ -n "$USBMS_FILE" ]; then
-            LIBUSB_FILE="${LIBUSB_FILE##*/}"
-            USBMS_FILE="${USBMS_FILE##*/}"
-            curl -fsSL "${REPO}/base/${LIBUSB_FILE}" -o /tmp/libusb.ipk
-            curl -fsSL "${REPO}/base/${USBMS_FILE}" -o /tmp/usbmode.ipk
-          else
-            echo "❌ 致命错误：在对应源中找不到 libusb 或 usb_modeswitch 包！"
-            exit 1
-          fi
-          
-          mkdir -p /tmp/usbex /tmp/umsx
-          tar -xzf /tmp/libusb.ipk -C /tmp/usbex; tar -xzf /tmp/usbex/data.tar.gz -C /tmp/usbex
-          tar -xzf /tmp/usbmode.ipk -C /tmp/umsx; tar -xzf /tmp/umsx/data.tar.gz -C /tmp/umsx
-          
-          mkdir -p inject/usr/lib inject/usr/sbin
-          cp -a /tmp/usbex/usr/lib/libusb-1.0.so* inject/usr/lib/ 2>/dev/null || true
-          cp -a /tmp/umsx/usr/sbin/usb_modeswitch inject/usr/sbin/ 2>/dev/null || true
-          
-          # 中文语言设置
-          printf '#!/bin/sh\nuci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null\nexit 0\n' > inject/etc/uci-defaults/99-zh-cn
+          cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
+          #!/bin/sh
+          for pkg in luci-lib-i18n luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn \
+                     luci-i18n-mwan3-zh-cn luci-i18n-opkg-zh-cn luci-i18n-wifi-zh-cn; do
+              [ -f "/opt/ipks/${pkg}.ipk" ] && opkg install "/opt/ipks/${pkg}.ipk" 2>/dev/null
+          done
+          uci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null
+          rm -rf /opt/ipks
+          exit 0
+          EOF
           chmod +x inject/etc/uci-defaults/99-zh-cn
           
-          # 默认 IP 修改
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > inject/etc/uci-defaults/99-set-lan-ip
           chmod +x inject/etc/uci-defaults/99-set-lan-ip
           
-          # 首次启动设置密码 + 拉起 Web 与 RPC 服务
           cat > inject/etc/uci-defaults/00-firstboot <<'FIRSTBOOT'
           #!/bin/sh
           echo "root:password" | chpasswd
+          /etc/init.d/usbfs enable 2>/dev/null
+          /etc/init.d/usbfs start 2>/dev/null
           /etc/init.d/uhttpd enable 2>/dev/null
           /etc/init.d/uhttpd start 2>/dev/null
           /etc/init.d/rpcd enable 2>/dev/null
@@ -343,6 +419,57 @@ jobs:
           exit 0
           FIRSTBOOT
           chmod +x inject/etc/uci-defaults/00-firstboot
+
+      - name: 准备中文语言包与默认网络
+        run: |
+          mkdir -p inject/opt/ipks
+          REL="${{ github.event.inputs.openwrt_version }}"
+          REL="${REL#v}"
+          
+          ARCH="aarch64_generic"
+          REPO="https://downloads.openwrt.org/releases/${REL}/packages/${ARCH}"
+          
+          download_ipk() {
+            local sub="$1" pkg="$2" file
+            file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip | \
+              awk -v p="${pkg}_" '
+                BEGIN { found=""; all="" }
+                $1=="Filename:" && index($2, p)==1 {
+                  if (!found) found=$2
+                  if ($2 ~ /_all\.ipk$/) { all=$2 }
+                }
+                END {
+                  if (all != "") print all
+                  else if (found != "") print found
+                  else exit 1
+                }
+              ' 2>/dev/null) || true
+            case "$file" in */*) ;; *) file="${sub}/${file}" ;; esac
+            if [ -n "$file" ]; then
+              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" && echo "✅ ${pkg}" || echo "❌ ${pkg} 下载失败"
+            else
+              echo "❌ 未找到 ${pkg}"
+            fi
+          }
+          
+          download_ipk luci luci-lib-i18n
+          download_ipk luci luci-i18n-base-zh-cn
+          download_ipk luci luci-i18n-firewall-zh-cn
+          download_ipk luci luci-i18n-mwan3-zh-cn
+          download_ipk luci luci-i18n-opkg-zh-cn
+          download_ipk luci luci-i18n-wifi-zh-cn
+          
+          # 【优化】语言包完整性硬校验
+          echo ">>> 校验语言包完整性..."
+          MISSING=""
+          for pkg in luci-lib-i18n luci-i18n-base-zh-cn; do
+              [ -f "inject/opt/ipks/${pkg}.ipk" ] || MISSING="${MISSING} ${pkg}"
+          done
+          if [ -n "$MISSING" ]; then
+              echo "❌ 关键语言包缺失:${MISSING}"
+              exit 1
+          fi
+          echo "✅ 语言包校验通过"
 
       - name: 克隆 OpenWrt 源码
         run: |
@@ -359,29 +486,27 @@ jobs:
           CONFIG_TARGET_armsr_armv8=y
           CONFIG_TARGET_ROOTFS_TARGZ=y
           
-          # 降级 Binutils 规避 musl off64_t bug
           CONFIG_BINUTILS_VERSION_2_40=y
           
-          # LuCI 核心与底层依赖
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_uhttpd=y
           CONFIG_PACKAGE_uhttpd-mod-ubus=y
           CONFIG_PACKAGE_rpcd=y
           CONFIG_PACKAGE_rpcd-mod-file=y
           
-          # 中文语言包
+          CONFIG_PACKAGE_luci-lib-i18n=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-opkg-zh-cn=y
+          CONFIG_PACKAGE_luci-i18n-wifi-zh-cn=y
           
-          # 无线与蓝牙
           CONFIG_PACKAGE_wpad-mbedtls=y
           CONFIG_PACKAGE_iw=y
           CONFIG_PACKAGE_iwinfo=y
           CONFIG_PACKAGE_bluez-daemon=y
           CONFIG_PACKAGE_bluez-utils=y
           
-          # 其他
           CONFIG_PACKAGE_usbutils=y
           CONFIG_PACKAGE_mwan3=y
           CONFIG_PACKAGE_luci-app-mwan3=y
@@ -408,7 +533,6 @@ jobs:
           rm -rf build_dir/toolchain-* build_dir/host
           make defconfig
 
-      # 【核心修复】将 cp --update 的 Hack 提前，确保 OpenWrt 编译过程中调用 cp 也安全
       - name: 临时修复 cp --update 兼容性 Bug
         run: |
           sudo mv /usr/bin/cp /usr/bin/cp.orig
