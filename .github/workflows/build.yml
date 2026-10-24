@@ -130,16 +130,18 @@ jobs:
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
           depmod -b /tmp/kmod ${KREL}
 
-      - name: 编译 usb_modeswitch 静态二进制 (musl版)
+      - name: 编译 usb_modeswitch 静态二进制 (修复 libusb 死锁)
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
           tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
           export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
           
-          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
+          # 【核心修复 1】退回最稳定的 libusb 1.0.26 版本，避开 1.0.27 在 6.12 上的 Bug
+          git clone --depth 1 --branch v1.0.26 https://github.com/libusb/libusb.git libusb-src || true
           if [ -d libusb-src ]; then
             cd libusb-src
+            # 强制关闭 udev 依赖，纯手工探测 USB 接口
             ./autogen.sh --host=aarch64-linux-musl --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
             make -j$(nproc) >/dev/null && make install >/dev/null
             cd ..
@@ -235,12 +237,12 @@ jobs:
           MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
           EOF
 
-          # 【热插拔脚本】支持系统运行中插入网卡自动切换
-          printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    1111/1111*)\n        sleep 1\n        /usr/sbin/usb_modeswitch -v 1111 -p 1111 -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n        ;;\n    a69c/8d80*|a69c/8d83*)\n        modprobe aic_load_fw 2>/dev/null ;;\n    a69c/8d81*|368b/8d81*)\n        modprobe cfg80211 2>/dev/null; modprobe aic8800_fdrv 2>/dev/null; modprobe aic_zlp_quirk 2>/dev/null; modprobe btusb 2>/dev/null ;;\nesac\nexit 0\n' > inject/etc/hotplug.d/usb/99-aic8800
+          # 【核心修复 2】热插拔脚本：先解绑 usb-storage 释放控制权，再用 -D -R 参数强行切换
+          printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    1111/1111*)\n        sleep 1\n        DEVPATH=$(echo "$DEVPATH" | sed "s/\\/devices//")\n        if [ -d "/sys/bus/usb/drivers/usb-storage/$DEVPATH:1.0" ]; then\n            echo -n "$DEVPATH:1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null\n        fi\n        /usr/sbin/usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n        ;;\n    a69c/8d80*|a69c/8d83*)\n        modprobe aic_load_fw 2>/dev/null ;;\n    a69c/8d81*|368b/8d81*)\n        modprobe cfg80211 2>/dev/null; modprobe aic8800_fdrv 2>/dev/null; modprobe aic_zlp_quirk 2>/dev/null; modprobe btusb 2>/dev/null ;;\nesac\nexit 0\n' > inject/etc/hotplug.d/usb/99-aic8800
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          # 【开机脚本】支持冷启动（开机前网卡已插好）的兜底逻辑
-          printf '#!/bin/sh\ni=0\nwhile [ $i -lt 20 ]; do\n    if lsusb 2>/dev/null | grep -qiE "a69c|368b"; then\n        modprobe cfg80211 2>/dev/null\n        modprobe aic_load_fw 2>/dev/null\n        modprobe aic8800_fdrv 2>/dev/null\n        break\n    fi\n    if lsusb 2>/dev/null | grep -q "1111:1111"; then\n        usb_modeswitch -v 1111 -p 1111 -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n    fi\n    sleep 3\n    i=$((i+3))\ndone\nexit 0\n' > inject/etc/rc.local
+          # 【核心修复 3】开机脚本：同样加入解绑和 -D -R 参数，防止冷启动被锁
+          printf '#!/bin/sh\ni=0\nwhile [ $i -lt 20 ]; do\n    if lsusb 2>/dev/null | grep -qiE "a69c|368b"; then\n        modprobe cfg80211 2>/dev/null\n        modprobe aic_load_fw 2>/dev/null\n        modprobe aic8800_fdrv 2>/dev/null\n        break\n    fi\n    if lsusb 2>/dev/null | grep -q "1111:1111"; then\n        for dev in /sys/bus/usb/devices/1-*; do\n            if [ -d "$dev" ] && [ -d "/sys/bus/usb/drivers/usb-storage/$(basename $dev):1.0" ]; then\n                echo -n "$(basename $dev):1.0" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null\n            fi\n        done\n        usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n    fi\n    sleep 3\n    i=$((i+3))\ndone\nexit 0\n' > inject/etc/rc.local
           chmod +x inject/etc/rc.local
           
           printf '#!/bin/sh\necho "==================================="\necho "  CPU Temp: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 )) C"\necho "==================================="\n' > inject/etc/profile.d/30-sysinfo.sh
