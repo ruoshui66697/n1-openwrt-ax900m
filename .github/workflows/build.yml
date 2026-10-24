@@ -90,7 +90,6 @@ jobs:
           cd ksrc-src
           KV="${{ env.KV }}"
           
-          # 存储与文件系统
           scripts/config -e CONFIG_BLK_DEV_SD
           scripts/config -e CONFIG_BLK_DEV_SR
           scripts/config -e CONFIG_USB_STORAGE
@@ -103,14 +102,12 @@ jobs:
           scripts/config -e CONFIG_VFAT_FS
           scripts/config -e CONFIG_NLS_UTF8
           
-          # USB 控制器 (修复 HC died 崩溃)
           scripts/config -e CONFIG_USB_XHCI_HCD
           scripts/config -e CONFIG_USB_EHCI_HCD
           scripts/config -e CONFIG_USB_DWC3
           scripts/config -e CONFIG_USB_DWC3_MESON_GXL
           scripts/config -e CONFIG_USB_XHCI_PLATFORM
           
-          # N1 有线网卡 (修复 Cannot attach to PHY)
           scripts/config -e CONFIG_NET_VENDOR_REALTEK
           scripts/config -e CONFIG_REALTEK_PHY
           scripts/config -e CONFIG_MDIO_BUS_MUX_MESON_GXL
@@ -133,22 +130,28 @@ jobs:
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
           depmod -b /tmp/kmod ${KREL}
 
-      - name: 编译 usb_modeswitch 静态二进制
+      - name: 编译 usb_modeswitch 静态二进制 (musl版)
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
+          wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
+          tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
+          export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
+          
           git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
           if [ -d libusb-src ]; then
             cd libusb-src
-            ./autogen.sh --host=aarch64-linux-gnu --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
+            ./autogen.sh --host=aarch64-linux-musl --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
             make -j$(nproc) >/dev/null && make install >/dev/null
             cd ..
           else
             log_err "libusb 克隆失败"; exit 1
           fi
+          
           curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
           tar xjf /tmp/ums.tar.bz2 -C /tmp
           cd /tmp/usb-modeswitch-2.6.1
-          aarch64-linux-gnu-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
+          aarch64-linux-musl-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c \
+            -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
           test -x usb_modeswitch || { log_err "usb_modeswitch 编译失败"; exit 1; }
           cp usb_modeswitch "$OLDPWD/"
 
@@ -218,21 +221,33 @@ jobs:
 
       - name: 组装注入包
         run: |
-          mkdir -p inject/opt/bin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d
+          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d
           test -f usb_modeswitch || { echo "usb_modeswitch 缺失"; exit 1; }
-          cp usb_modeswitch inject/opt/bin/
+          cp usb_modeswitch inject/usr/sbin/
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
-          MS_FILE=$(find aicsrc -path '*modeswitch*' -type f ! -name '*.md' 2>/dev/null | head -1 || true)
-          if [ -n "$MS_FILE" ]; then cp "$MS_FILE" "inject/etc/usb_modeswitch.d/1111:1111"; fi
-          printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    a69c/8d80*|a69c/8d83*) modprobe aic_load_fw 2>/dev/null ;;\n    a69c/8d81*|368b/8d81*) modprobe cfg80211 2>/dev/null; modprobe aic8800_fdrv 2>/dev/null; modprobe aic_zlp_quirk 2>/dev/null; modprobe btusb 2>/dev/null ;;\nesac\nexit 0\n' > inject/etc/hotplug.d/usb/99-aic8800
+          
+          # 写入官方正确的配置
+          cat > inject/etc/usb_modeswitch.d/1111:1111 <<'EOF'
+          DefaultVendor=0x1111
+          DefaultProduct=0x1111
+          TargetVendor=0xa69c
+          TargetProduct=0x8d80
+          MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
+          EOF
+
+          # 【热插拔脚本】支持系统运行中插入网卡自动切换
+          printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    1111/1111*)\n        sleep 1\n        /usr/sbin/usb_modeswitch -v 1111 -p 1111 -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n        ;;\n    a69c/8d80*|a69c/8d83*)\n        modprobe aic_load_fw 2>/dev/null ;;\n    a69c/8d81*|368b/8d81*)\n        modprobe cfg80211 2>/dev/null; modprobe aic8800_fdrv 2>/dev/null; modprobe aic_zlp_quirk 2>/dev/null; modprobe btusb 2>/dev/null ;;\nesac\nexit 0\n' > inject/etc/hotplug.d/usb/99-aic8800
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
-          printf '#!/bin/sh\ni=0\nwhile [ $i -lt 40 ]; do\n    if lsusb 2>/dev/null | grep -qiE "a69c|368b"; then break; fi\n    if lsusb 2>/dev/null | grep -q "1111:1111"; then\n        usb_modeswitch -v 0x1111 -p 0x1111 -M 555342438765432100000000000010fd0000000000000000000000000000f3 -M 555342438765432100000000000010fd0000000000000000000000000000f2 >/dev/null 2>&1\n    fi\n    sleep 3\n    i=$((i+3))\ndone\nexit 0\n' > inject/etc/rc.local
+          
+          # 【开机脚本】支持冷启动（开机前网卡已插好）的兜底逻辑
+          printf '#!/bin/sh\ni=0\nwhile [ $i -lt 20 ]; do\n    if lsusb 2>/dev/null | grep -qiE "a69c|368b"; then\n        modprobe cfg80211 2>/dev/null\n        modprobe aic_load_fw 2>/dev/null\n        modprobe aic8800_fdrv 2>/dev/null\n        break\n    fi\n    if lsusb 2>/dev/null | grep -q "1111:1111"; then\n        usb_modeswitch -v 1111 -p 1111 -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1\n    fi\n    sleep 3\n    i=$((i+3))\ndone\nexit 0\n' > inject/etc/rc.local
           chmod +x inject/etc/rc.local
+          
           printf '#!/bin/sh\necho "==================================="\necho "  CPU Temp: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 )) C"\necho "==================================="\n' > inject/etc/profile.d/30-sysinfo.sh
           chmod +x inject/etc/profile.d/30-sysinfo.sh
           rm -rf aicsrc
 
-      - name: 准备中文语言包
+      - name: 准备中文语言包与默认网络
         run: |
           mkdir -p inject/opt/ipks inject/etc/uci-defaults
           REL="${{ github.event.inputs.openwrt_version }}"
@@ -247,8 +262,14 @@ jobs:
           download_ipk luci luci-i18n-base-zh-cn
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
-          printf '#!/bin/sh\nopkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nopkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nfor d in /usr/sbin /usr/bin /sbin /bin; do cp /opt/bin/usb_modeswitch "$d/" 2>/dev/null; done\nuci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null\nexit 0\n' > inject/etc/uci-defaults/99-zh-cn
+          
+          # 中文语言设置
+          printf '#!/bin/sh\nopkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nopkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nuci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null\nexit 0\n' > inject/etc/uci-defaults/99-zh-cn
           chmod +x inject/etc/uci-defaults/99-zh-cn
+          
+          # 【默认 IP 修改】将局域网地址改为 192.168.10.1
+          printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > inject/etc/uci-defaults/99-set-lan-ip
+          chmod +x inject/etc/uci-defaults/99-set-lan-ip
 
       - name: 克隆 OpenWrt 源码
         run: |
@@ -276,7 +297,6 @@ jobs:
             exit 1
           fi
 
-      # ================= 核心修复区 =================
       - name: 临时修复 cp --update 兼容性 Bug
         run: |
           sudo mv /usr/bin/cp /usr/bin/cp.orig
@@ -312,7 +332,6 @@ jobs:
           if [ -f /usr/bin/cp.orig ]; then
             sudo mv /usr/bin/cp.orig /usr/bin/cp
           fi
-      # ================= 核心修复区 =================
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
