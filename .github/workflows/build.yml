@@ -323,7 +323,7 @@ jobs:
           cp -a /tmp/usbex/usr/lib/libusb-1.0.so* inject/usr/lib/ 2>/dev/null || true
           cp -a /tmp/umsx/usr/sbin/usb_modeswitch inject/usr/sbin/ 2>/dev/null || true
           
-          # 中文语言设置 (纯 UCI 操作，语言包已在固件中)
+          # 中文语言设置
           printf '#!/bin/sh\nuci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null\nexit 0\n' > inject/etc/uci-defaults/99-zh-cn
           chmod +x inject/etc/uci-defaults/99-zh-cn
           
@@ -359,6 +359,9 @@ jobs:
           CONFIG_TARGET_armsr_armv8=y
           CONFIG_TARGET_ROOTFS_TARGZ=y
           
+          # 降级 Binutils 规避 musl off64_t bug
+          CONFIG_BINUTILS_VERSION_2_40=y
+          
           # LuCI 核心与底层依赖
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_uhttpd=y
@@ -385,29 +388,27 @@ jobs:
           EOF
           make defconfig
 
-      - name: 缓存 OpenWrt 编译产物
+      - name: 缓存 OpenWrt 源码包
         uses: actions/cache@v4
         with:
-          path: |
-            openwrt/dl
-            openwrt/staging_dir
-          key: n1-owrt-${{ github.event.inputs.openwrt_version }}-${{ hashFiles('openwrt/.config') }}
+          path: openwrt/dl
+          key: n1-owrt-dl-${{ github.event.inputs.openwrt_version }}-${{ hashFiles('openwrt/.config') }}
           restore-keys: |
-            n1-owrt-${{ github.event.inputs.openwrt_version }}-
+            n1-owrt-dl-${{ github.event.inputs.openwrt_version }}-
 
       - name: 下载源码包
         run: |
           cd openwrt
           make download -j$(nproc) || make download -j1 V=s
 
-      - name: 编译 OpenWrt rootfs
+      - name: 清理旧构建产物
         run: |
           cd openwrt
-          if ! make -j$(nproc) 2>>"$ERR_FILE"; then
-            make -j1 V=s 2>&1 | tee -a "$ERR_FILE"
-            exit 1
-          fi
+          rm -rf staging_dir/host staging_dir/toolchain-*
+          rm -rf build_dir/toolchain-* build_dir/host
+          make defconfig
 
+      # 【核心修复】将 cp --update 的 Hack 提前，确保 OpenWrt 编译过程中调用 cp 也安全
       - name: 临时修复 cp --update 兼容性 Bug
         run: |
           sudo mv /usr/bin/cp /usr/bin/cp.orig
@@ -426,6 +427,14 @@ jobs:
           exec /usr/bin/cp.orig "${args[@]}"
           EOF
           sudo chmod +x /usr/bin/cp
+
+      - name: 编译 OpenWrt rootfs
+        run: |
+          cd openwrt
+          if ! make -j$(nproc) 2>>"$ERR_FILE"; then
+            make -j1 V=s 2>&1 | tee -a "$ERR_FILE"
+            exit 1
+          fi
 
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
