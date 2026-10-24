@@ -17,13 +17,17 @@ on:
           - main
           - legacy-mcu1
 
+# 【优化】全局引入环境变量，方便后续启用 SHA256 校验
+env:
+  BUSYBOX_TOOLCHAIN_SHA256: ${{ secrets.BUSYBOX_TOOLCHAIN_SHA256 }}
+
 jobs:
   build:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - name: 初始化错误日志
+      - name: 初始化与前置校验
         run: |
           ERR_FILE="$GITHUB_WORKSPACE/error_log.txt"
           echo "=== Build Error Log ===" > "$ERR_FILE"
@@ -31,6 +35,12 @@ jobs:
           echo "Run: ${{ github.run_id }}" >> "$ERR_FILE"
           echo "========================" >> "$ERR_FILE"
           echo "ERR_FILE=$ERR_FILE" >> $GITHUB_ENV
+          
+          echo ">>> 正在预检驱动分支..."
+          if ! git ls-remote --heads https://github.com/shenmintao/aic8800d80.git | grep -q "refs/heads/${{ github.event.inputs.driver_branch }}"; then
+            echo "[❌] 驱动分支 ${{ github.event.inputs.driver_branch }} 不存在，请检查输入！"
+            exit 1
+          fi
 
       - name: 安装编译依赖
         run: |
@@ -41,16 +51,6 @@ jobs:
             gcc-aarch64-linux-gnu bc libelf-dev kmod bzip2 \
             zstd lz4 u-boot-tools cpio dosfstools \
             libtool pkg-config autoconf automake jq
-
-      - name: 缓存 OpenWrt 源码包
-        uses: actions/cache@v4
-        with:
-          path: |
-            openwrt/dl
-            openwrt/staging_dir
-          key: n1-openwrt-${{ github.event.inputs.openwrt_version }}-${{ github.run_id }}
-          restore-keys: |
-            n1-openwrt-${{ github.event.inputs.openwrt_version }}-
 
       - name: 查询 flippy 内核版本并获取内核配置
         run: |
@@ -72,13 +72,6 @@ jobs:
       - name: 准备内核源码与 AX900M 驱动源码
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          
-          # 前置验证驱动分支是否存在
-          if ! git ls-remote --heads https://github.com/shenmintao/aic8800d80.git | grep -q "refs/heads/${{ github.event.inputs.driver_branch }}"; then
-            log_err "驱动分支 ${{ github.event.inputs.driver_branch }} 不存在，请检查输入！"
-            exit 1
-          fi
-
           rm -rf ksrc-src
           git clone --depth 100 https://github.com/unifreq/linux-6.12.y.git ksrc-src
           cd ksrc-src
@@ -109,7 +102,6 @@ jobs:
           
           scripts/config -e CONFIG_BLK_DEV_SD
           scripts/config -e CONFIG_BLK_DEV_SR
-          # P2: 确认编译进内核 (=y)
           scripts/config -e CONFIG_USB_STORAGE
           scripts/config -e CONFIG_USB_UAS
           scripts/config -e CONFIG_SCSI_MOD
@@ -151,6 +143,16 @@ jobs:
       - name: 编译 busybox 静态二进制
         run: |
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
+          if [ -n "$BUSYBOX_TOOLCHAIN_SHA256" ]; then
+              ACTUAL_SHA256=$(sha256sum /tmp/aarch64-linux-musl-cross.tgz | awk '{print $1}')
+              if [ "$ACTUAL_SHA256" != "$BUSYBOX_TOOLCHAIN_SHA256" ]; then
+                  echo "❌ 工具链 SHA256 校验失败！"; exit 1
+              fi
+              echo "✅ 工具链校验通过"
+          else
+              echo "⚠️ 未设置 BUSYBOX_TOOLCHAIN_SHA256，跳过完整性校验"
+          fi
+          
           tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
           export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
           curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
@@ -192,7 +194,7 @@ jobs:
           [ -d "$MOD_SRC/drivers/usb/storage" ] && mkdir -p "$MOD_DST/drivers/usb/storage" && find "$MOD_SRC/drivers/usb/storage" -name '*.ko' -exec cp {} "$MOD_DST/drivers/usb/storage/" \;
           [ -d "$MOD_SRC/drivers/scsi" ] && mkdir -p "$MOD_DST/drivers/scsi" && find "$MOD_SRC/drivers/scsi" -name '*.ko' -exec cp {} "$MOD_DST/drivers/scsi/" \;
           
-          printf '#!/bin/sh\nexec >/dev/console 2>&1\nexport PATH=/bin:/sbin\necho "=== N1 Custom Initramfs ==="\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmkdir -p /dev/pts /dev/shm\nmount -t devpts devpts /dev/pts\nmount -t tmpfs tmpfs /tmp\nmount -t tmpfs tmpfs /run\necho "[init] Loading storage modules..."\nfor mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do modprobe $mod 2>/dev/null; done\necho "[init] Waiting for USB (5s)..."\nsleep 5\nROOT_DEV=""\nMOUNT_OPTS=""\nfind_root() {\n    if [ -x /bin/findfs ]; then ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null); [ -n "$ROOT_DEV" ] && return 0; fi\n    for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do\n        [ -b "$dev" ] || continue\n        mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t ext4 -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n    done\n    return 1\n}\nif ! find_root; then sleep 5; if ! find_root; then echo "!!! FATAL: Cannot mount rootfs !!!"; exec /bin/sh; fi; fi\necho "[init] Root found: $ROOT_DEV"\numount -l /mnt 2>/dev/null || umount /mnt 2>/dev/null || true\n[ -n "$MOUNT_OPTS" ] && mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt\nif [ -x /mnt/sbin/init ]; then\n    umount /dev/pts 2>/dev/null || true\n    umount /dev 2>/dev/null || true\n    umount /sys 2>/dev/null || true\n    umount /proc 2>/dev/null || true\n    umount /tmp 2>/dev/null || true\n    umount /run 2>/dev/null || true\n    exec switch_root /mnt /sbin/init\nfi\necho "!!! /mnt/sbin/init missing !!!"; exec /bin/sh\n' > /tmp/initrd/init
+          printf '#!/bin/sh\nexec >/dev/console 2>&1\nexport PATH=/bin:/sbin\necho "=== N1 Custom Initramfs ==="\nmount -t devtmpfs devtmpfs /dev\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmkdir -p /dev/pts /dev/shm\nmount -t devpts devpts /dev/pts\nmount -t tmpfs tmpfs /tmp\nmount -t tmpfs tmpfs /run\necho "[init] Loading storage modules..."\nfor mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do modprobe $mod 2>/dev/null; done\necho "[init] Waiting for USB storage devices (max 15s)..."\ni=0\nwhile [ $i -lt 15 ]; do\n    FOUND=""\n    for d in /dev/sda1 /dev/sda2 /dev/sdb1 /dev/sdb2 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2; do\n        [ -b "$d" ] && { FOUND=1; break; }\n    done\n    [ -n "$FOUND" ] && break\n    sleep 1\n    i=$((i+1))\ndone\necho "[init] Device probe finished after ${i}s"\nROOT_DEV=""\nMOUNT_OPTS=""\nfind_root() {\n    if [ -x /bin/findfs ]; then ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null); [ -n "$ROOT_DEV" ] && return 0; fi\n    for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do\n        [ -b "$dev" ] || continue\n        mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t btrfs -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n        mount -t ext4 -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }\n    done\n    return 1\n}\nif ! find_root; then sleep 5; if ! find_root; then echo "!!! FATAL: Cannot mount rootfs !!!"; exec /bin/sh; fi; fi\necho "[init] Root found: $ROOT_DEV"\numount -l /mnt 2>/dev/null || umount /mnt 2>/dev/null || true\n[ -n "$MOUNT_OPTS" ] && mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt\nif [ -x /mnt/sbin/init ]; then\n    umount /dev/pts 2>/dev/null || true\n    umount /dev 2>/dev/null || true\n    umount /sys 2>/dev/null || true\n    umount /proc 2>/dev/null || true\n    umount /tmp 2>/dev/null || true\n    umount /run 2>/dev/null || true\n    exec switch_root /mnt /sbin/init\nfi\necho "!!! /mnt/sbin/init missing !!!"; exec /bin/sh\n' > /tmp/initrd/init
           chmod +x /tmp/initrd/init
           (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
@@ -209,10 +211,19 @@ jobs:
           cd .. && tar czf ${KV}.tar.gz ${KV}
           test -f "${KV}.tar.gz" || { echo "Release 资产缺失"; exit 1; }
           
-          # 【优化】Release 标签加入 Run ID 防止冲突
           RELEASE_TAG="kernel-${KV}-${{ github.run_number }}"
-          gh release delete "$RELEASE_TAG" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create "$RELEASE_TAG" ${KV}.tar.gz --repo ${{ github.repository }} -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
+          
+          echo ">>> 正在清理旧的 Release..."
+          gh release list --repo ${{ github.repository }} --limit 100 \
+            | grep "^kernel-[0-9]" \
+            | tail -n +6 \
+            | awk '{print $1}' \
+            | while read tag; do
+                echo "Deleting old release: $tag"
+                gh release delete "$tag" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
+              done
+              
           rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/busybox-root" /tmp/aarch64-linux-musl-cross
 
       - name: 组装注入包
@@ -220,7 +231,6 @@ jobs:
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           
-          # 写入官方正确的配置
           cat > inject/etc/usb_modeswitch.d/1111:1111 <<'EOF'
           DefaultVendor=0x1111
           DefaultProduct=0x1111
@@ -229,7 +239,6 @@ jobs:
           MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
           EOF
 
-          # 【P1 核心修复】使用 heredoc 重写热插拔脚本
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
@@ -256,7 +265,6 @@ jobs:
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          # 【优化】重写开机脚本，彻底抛弃 lsusb，改用 sysfs 检测
           cat > inject/etc/rc.local <<'EOF'
           #!/bin/sh
           i=0
@@ -291,7 +299,10 @@ jobs:
           mkdir -p inject/opt/ipks
           REL="${{ github.event.inputs.openwrt_version }}"
           REL="${REL#v}"
-          REPO="https://downloads.openwrt.org/releases/${REL}/packages/aarch64_generic"
+          
+          ARCH="aarch64_generic"
+          REPO="https://downloads.openwrt.org/releases/${REL}/packages/${ARCH}"
+          
           download_ipk() {
             local sub="$1" pkg="$2" file
             file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip | awk -v p="${pkg}_" '$1=="Filename:" && $2 ~ p {print $2; exit}' || true)
@@ -302,10 +313,19 @@ jobs:
           download_ipk luci luci-i18n-firewall-zh-cn
           download_ipk luci luci-i18n-mwan3-zh-cn
           
-          # 【P0 & P3 核心修复】直接下载官方原版动态库和工具
-          echo ">>> 正在下载官方原生动态版 libusb 和 usb_modeswitch..."
-          curl -fsSL "https://downloads.openwrt.org/releases/23.05.5/packages/aarch64_cortex-a53/base/libusb-1.0-0_1.0.26-3_aarch64_cortex-a53.ipk" -o /tmp/libusb.ipk
-          curl -fsSL "https://downloads.openwrt.org/releases/23.05.5/packages/aarch64_cortex-a53/base/usb-modeswitch_2022-02-24-3c8595a4-1_aarch64_cortex-a53.ipk" -o /tmp/usbmode.ipk
+          echo ">>> 正在动态解析对应版本 (${REL}) 的 libusb 和 usb_modeswitch 依赖..."
+          LIBUSB_FILE=$(curl -fsSL "${REPO}/base/Packages.gz" | gunzip | awk '$1=="Filename:" && $2 ~ /libusb-1.0-0_/ {print $2; exit}')
+          USBMS_FILE=$(curl -fsSL "${REPO}/base/Packages.gz" | gunzip | awk '$1=="Filename:" && $2 ~ /usb-modeswitch_/ {print $2; exit}')
+          
+          if [ -n "$LIBUSB_FILE" ] && [ -n "$USBMS_FILE" ]; then
+            LIBUSB_FILE="${LIBUSB_FILE##*/}"
+            USBMS_FILE="${USBMS_FILE##*/}"
+            curl -fsSL "${REPO}/base/${LIBUSB_FILE}" -o /tmp/libusb.ipk
+            curl -fsSL "${REPO}/base/${USBMS_FILE}" -o /tmp/usbmode.ipk
+          else
+            echo "❌ 致命错误：在对应源中找不到 libusb 或 usb_modeswitch 包！"
+            exit 1
+          fi
           
           mkdir -p /tmp/usbex /tmp/umsx
           tar -xzf /tmp/libusb.ipk -C /tmp/usbex; tar -xzf /tmp/usbex/data.tar.gz -C /tmp/usbex
@@ -315,11 +335,9 @@ jobs:
           cp -a /tmp/usbex/usr/lib/libusb-1.0.so* inject/usr/lib/ 2>/dev/null || true
           cp -a /tmp/umsx/usr/sbin/usb_modeswitch inject/usr/sbin/ 2>/dev/null || true
           
-          # 中文语言设置
           printf '#!/bin/sh\nopkg install /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nopkg install --force-reinstall /opt/ipks/luci-i18n-*.ipk 2>/dev/null\nuci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null\nexit 0\n' > inject/etc/uci-defaults/99-zh-cn
           chmod +x inject/etc/uci-defaults/99-zh-cn
           
-          # 【默认 IP 修改】将局域网地址改为 192.168.10.1
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > inject/etc/uci-defaults/99-set-lan-ip
           chmod +x inject/etc/uci-defaults/99-set-lan-ip
 
@@ -335,6 +353,16 @@ jobs:
           cd openwrt
           printf 'CONFIG_TARGET_armsr=y\nCONFIG_TARGET_armsr_armv8=y\nCONFIG_TARGET_ROOTFS_TARGZ=y\nCONFIG_PACKAGE_luci=y\nCONFIG_PACKAGE_luci-i18n-base-zh-cn=y\nCONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y\nCONFIG_PACKAGE_wpad-mbedtls=y\nCONFIG_PACKAGE_iw=y\nCONFIG_PACKAGE_iwinfo=y\nCONFIG_PACKAGE_bluez-daemon=y\nCONFIG_PACKAGE_bluez-utils=y\nCONFIG_PACKAGE_usbutils=y\nCONFIG_PACKAGE_mwan3=y\nCONFIG_PACKAGE_luci-app-mwan3=y\nCONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y\n' > .config
           make defconfig
+
+      - name: 缓存 OpenWrt 编译产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir
+          key: n1-owrt-${{ github.event.inputs.openwrt_version }}-${{ hashFiles('openwrt/.config') }}
+          restore-keys: |
+            n1-owrt-${{ github.event.inputs.openwrt_version }}-
 
       - name: 下载源码包
         run: |
@@ -388,7 +416,6 @@ jobs:
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          # 【优化】产物命名带版本号
           name: N1-OpenWrt-AX900M-${{ env.KV }}-${{ github.run_number }}
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
@@ -398,7 +425,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-error-log-${{ github.run_number }}
-          # 【优化】同时上传 openwrt/logs/ 目录
           path: |
             ${{ github.workspace }}/error_log.txt
             openwrt/logs/
@@ -428,7 +454,8 @@ jobs:
             fi
           fi
           
-          PAYLOAD=$(jq -n --arg title "$TITLE" --arg content "$CONTENT" --arg url "$RUN_URL" '{msgtype:"text", text:{content: ($title + "\n" + $content + "\n" + $url)}}')
+          FORMATTED_CONTENT=$(printf "%b" "$CONTENT")
+          PAYLOAD=$(jq -n --arg title "$TITLE" --arg content "$FORMATTED_CONTENT" --arg url "$RUN_URL" '{msgtype:"text", text:{content: ($title + "\n" + $content + "\n" + $url)}}')
           
           if [ -n "$DINGTALK_SECRET" ]; then
             TIMESTAMP=$(date +%s000)
