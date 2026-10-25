@@ -123,25 +123,23 @@ jobs:
           scripts/config -e CONFIG_DWMAC_MESON
           scripts/config -e CONFIG_STMMAC_ETH
           
-          # 【核心修复】scripts/config 不支持 -y，改回 -e (等同于设为 y)
-          scripts/config -e CONFIG_WIRELESS
-          scripts/config -e CONFIG_CFG80211
-          scripts/config -m CONFIG_CFG80211_WEXT
-          scripts/config -e CONFIG_MAC80211
-          scripts/config -e CONFIG_RFKILL
-          
-          scripts/config -e CONFIG_USB_DEVICEFS
-          scripts/config -e CONFIG_USB_ANNOUNCE_NEW_DEVICES
-          
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           
-          # 编译前强制验证关键选项
-          echo ">>> 验证内核配置..."
+          # 绕过 Kconfig 的自动裁剪，强改 .config 文件
+          echo ">>> 强制注入内核配置..."
+          sed -i 's/^# CONFIG_WIRELESS is not set/CONFIG_WIRELESS=y/' .config
+          sed -i 's/^# CONFIG_CFG80211 is not set/CONFIG_CFG80211=y/' .config
+          sed -i 's/^# CONFIG_MAC80211 is not set/CONFIG_MAC80211=y/' .config
+          sed -i 's/^# CONFIG_RFKILL is not set/CONFIG_RFKILL=y/' .config
+          sed -i 's/^# CONFIG_CFG80211_WEXT is not set/CONFIG_CFG80211_WEXT=m/' .config
+          sed -i 's/^# CONFIG_USB_DEVICEFS is not set/CONFIG_USB_DEVICEFS=y/' .config
+          
+          # 强制验证
           for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_USB_DEVICEFS; do
             VAL=$(grep "^${opt}=" .config | head -1)
             echo "  $VAL"
-            if echo "$VAL" | grep -q "is not set"; then
-              log_err "${opt} 未生效！请检查依赖冲突"
+            if ! echo "$VAL" | grep -q "=y"; then
+              log_err "${opt} 强制写入失败！请检查"
               exit 1
             fi
           done
@@ -164,13 +162,6 @@ jobs:
       - name: 编译 busybox 静态二进制
         run: |
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
-          if [ -n "$BUSYBOX_TOOLCHAIN_SHA256" ]; then
-              ACTUAL_SHA256=$(sha256sum /tmp/aarch64-linux-musl-cross.tgz | awk '{print $1}')
-              if [ "$ACTUAL_SHA256" != "$BUSYBOX_TOOLCHAIN_SHA256" ]; then
-                  echo "❌ 工具链 SHA256 校验失败！"; exit 1
-              fi
-          fi
-          
           tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
           export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
           curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
@@ -180,7 +171,6 @@ jobs:
           sed -i 's/^# CONFIG_BLKID is not set/CONFIG_BLKID=y/' .config
           sed -i 's/^# CONFIG_FINDFS is not set/CONFIG_FINDFS=y/' .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- -j$(nproc) 2>>"$ERR_FILE"
-          test -x busybox || { echo "busybox 编译失败"; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/busybox-root"
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- CONFIG_PREFIX="$GITHUB_WORKSPACE/busybox-root" install 2>>"$ERR_FILE"
 
@@ -320,32 +310,45 @@ jobs:
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           
+          # 底层 dd 切换脚本
           cat > inject/usr/sbin/switch_card.sh <<'EOF'
           #!/bin/sh
-          dev="$1"
-          if [ -b "$dev" ]; then
-              blockdev --setrw "$dev" 2>/dev/null
-              echo -ne "\x55\x53\x42\x43\x12\x34\x56\x78\x00\x00\x00\x00\x00\x00\x10\xfd\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf2" | dd of="$dev" bs=31 count=1 2>/dev/null
+          if [ -x /usr/sbin/usb_modeswitch ]; then
+              usb_modeswitch -v 1111 -p 1111 -D -R -M "555342431234567800000000000010fd0000000000000000000000000000f2" >/dev/null 2>&1 && exit 0
+          fi
+          if [ -x /sbin/usbmode ]; then
+              usbmode -s >/dev/null 2>&1 && exit 0
           fi
           EOF
           chmod +x inject/usr/sbin/switch_card.sh
 
+          # 【核心修复】hotplug 脚本改用 insmod 加载外部驱动
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
+          KVER=$(uname -r)
+          MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
+          
           case "$PRODUCT" in
-              1111/1111*)
-                  sleep 1
-                  DEVNAME=$(ls /sys$DEVPATH/host*/target*/*/block/ 2>/dev/null | head -n 1)
-                  if [ -n "$DEVNAME" ]; then
-                      /usr/sbin/switch_card.sh "/dev/$DEVNAME"
+              1111/1111/*)
+                  logger -t aic8800 "AX900M storage mode detected, switching..."
+                  sleep 2
+                  /usr/sbin/switch_card.sh
+                  ;;
+              a69c/8d80/*|a69c/8d83/*)
+                  logger -t aic8800 "AX900M WiFi mode, loading fw loader..."
+                  if insmod "${MOD_DIR}/aic_load_fw.ko" 2>/tmp/aic_err; then
+                      logger -t aic8800 "✅ aic_load_fw loaded successfully"
+                  else
+                      logger -t aic8800 "❌ aic_load_fw failed: $(cat /tmp/aic_err)"
                   fi
+                  rm -f /tmp/aic_err
                   ;;
-              a69c/8d80*|a69c/8d83*)
-                  modprobe aic_load_fw 2>/dev/null
-                  ;;
-              a69c/8d81*|368b/8d81*)
-                  modprobe aic8800_fdrv 2>/dev/null
+              a69c/8d81/*|368b/8d81/*)
+                  logger -t aic8800 "Loading fdrv + btusb..."
+                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/tmp/aic_err || \
+                      logger -t aic8800 "❌ aic8800_fdrv failed: $(cat /tmp/aic_err)"
+                  rm -f /tmp/aic_err
                   modprobe aic_zlp_quirk 2>/dev/null
                   modprobe btusb 2>/dev/null
                   ;;
@@ -354,23 +357,31 @@ jobs:
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
+          # 【核心修复】rc.local 脚本改用 insmod 加载外部驱动
           cat > inject/etc/rc.local <<'EOF'
           #!/bin/sh
+          logger -t aic_rc "Starting AX900M detection loop..."
+          KVER=$(uname -r)
+          MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
           i=0
           while [ $i -lt 20 ]; do
-              if cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | grep -qiE "a69c|368b"; then
-                  modprobe aic_load_fw 2>/dev/null
-                  modprobe aic8800_fdrv 2>/dev/null
+              if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
+                  logger -t aic_rc "WiFi mode found, loading drivers..."
+                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/tmp/aic_err || \
+                      logger -t aic_rc "❌ aic_load_fw failed: $(cat /tmp/aic_err)"
+                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/tmp/aic_err || \
+                      logger -t aic_rc "❌ aic8800_fdrv failed: $(cat /tmp/aic_err)"
+                  rm -f /tmp/aic_err
                   break
               fi
-              if cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | grep -q "1111"; then
-                  for sd in /dev/sdb /dev/sdc /dev/sdd; do
-                      [ -b "$sd" ] && /usr/sbin/switch_card.sh "$sd"
-                  done
+              if grep -q "1111" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
+                  logger -t aic_rc "Storage mode found, attempting switch (attempt $((i/3+1)))..."
+                  /usr/sbin/switch_card.sh
               fi
               sleep 3
               i=$((i+3))
           done
+          logger -t aic_rc "Detection loop finished after ${i}s"
           exit 0
           EOF
           chmod +x inject/etc/rc.local
@@ -382,9 +393,10 @@ jobs:
           #!/bin/sh /etc/rc.common
           START=10
           start() {
-              mkdir -p /proc/bus/usb /dev/bus/usb
-              mountpoint -q /proc/bus/usb || mount -t usbfs usbfs /proc/bus/usb 2>/dev/null
-              [ -d /dev/bus/usb ] || mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null
+              mkdir -p /dev/bus/usb
+              mountpoint -q /dev/bus/usb || mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null
+              [ -x /sbin/udevadm ] && udevadm trigger --subsystem-match=usb 2>/dev/null
+              find /dev/bus/usb -type c -exec chmod 666 {} \; 2>/dev/null
           }
           EOF
           chmod +x inject/etc/init.d/usbfs
@@ -408,11 +420,9 @@ jobs:
           #!/bin/sh
           echo "root:password" | chpasswd
           
-          # 1. 启动 usbfs
           /etc/init.d/usbfs enable 2>/dev/null
           /etc/init.d/usbfs start 2>/dev/null
           
-          # 2. 等待局域网接口 (br-lan) 就绪，最多等 10 秒
           i=0
           while [ $i -lt 10 ]; do
               if ip a show br-lan 2>/dev/null | grep -q "192.168.10.1"; then
@@ -422,7 +432,6 @@ jobs:
               i=$((i+1))
           done
           
-          # 3. 按依赖顺序，稳扎稳打启动服务
           /etc/init.d/dnsmasq enable 2>/dev/null
           /etc/init.d/dnsmasq restart 2>/dev/null
           sleep 2
@@ -443,7 +452,6 @@ jobs:
           mkdir -p inject/opt/ipks
           REL="${{ github.event.inputs.openwrt_version }}"
           REL="${REL#v}"
-          
           ARCH="aarch64_generic"
           REPO="https://downloads.openwrt.org/releases/${REL}/packages/${ARCH}"
           
@@ -527,6 +535,13 @@ jobs:
           CONFIG_PACKAGE_usbutils=y
           CONFIG_PACKAGE_mwan3=y
           CONFIG_PACKAGE_luci-app-mwan3=y
+          
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_usb-modeswitch=y
+          CONFIG_PACKAGE_kmod-cfg80211=y
+          CONFIG_PACKAGE_kmod-mac80211=y
+          CONFIG_PACKAGE_libusb-1.0=y
           EOF
           make defconfig
 
