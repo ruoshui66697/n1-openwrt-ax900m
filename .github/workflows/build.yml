@@ -123,20 +123,19 @@ jobs:
           scripts/config -e CONFIG_DWMAC_MESON
           scripts/config -e CONFIG_STMMAC_ETH
           
-          # 【核心修复 1】强制内置无线核心依赖
-          scripts/config -y CONFIG_WIRELESS
-          scripts/config -y CONFIG_CFG80211
+          # 【核心修复】scripts/config 不支持 -y，改回 -e (等同于设为 y)
+          scripts/config -e CONFIG_WIRELESS
+          scripts/config -e CONFIG_CFG80211
           scripts/config -m CONFIG_CFG80211_WEXT
-          scripts/config -y CONFIG_MAC80211
-          scripts/config -y CONFIG_RFKILL
+          scripts/config -e CONFIG_MAC80211
+          scripts/config -e CONFIG_RFKILL
           
-          # 【核心修复 2】强制启用 USB DeviceFS
-          scripts/config -y CONFIG_USB_DEVICEFS
-          scripts/config -y CONFIG_USB_ANNOUNCE_NEW_DEVICES
+          scripts/config -e CONFIG_USB_DEVICEFS
+          scripts/config -e CONFIG_USB_ANNOUNCE_NEW_DEVICES
           
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           
-          # 【新增】编译前强制验证关键选项
+          # 编译前强制验证关键选项
           echo ">>> 验证内核配置..."
           for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_USB_DEVICEFS; do
             VAL=$(grep "^${opt}=" .config | head -1)
@@ -213,7 +212,6 @@ jobs:
           [ -d "$MOD_SRC/drivers/usb/storage" ] && mkdir -p "$MOD_DST/drivers/usb/storage" && find "$MOD_SRC/drivers/usb/storage" -name '*.ko' -exec cp {} "$MOD_DST/drivers/usb/storage/" \;
           [ -d "$MOD_SRC/drivers/scsi" ] && mkdir -p "$MOD_DST/drivers/scsi" && find "$MOD_SRC/drivers/scsi" -name '*.ko' -exec cp {} "$MOD_DST/drivers/scsi/" \;
           
-          # 【优化】使用 heredoc 提升可读性，并在 switch_root 前卸载 usbfs
           cat > /tmp/initrd/init <<'INITSCRIPT'
           #!/bin/sh
           exec >/dev/console 2>&1
@@ -409,13 +407,33 @@ jobs:
           cat > inject/etc/uci-defaults/00-firstboot <<'FIRSTBOOT'
           #!/bin/sh
           echo "root:password" | chpasswd
+          
+          # 1. 启动 usbfs
           /etc/init.d/usbfs enable 2>/dev/null
           /etc/init.d/usbfs start 2>/dev/null
-          /etc/init.d/uhttpd enable 2>/dev/null
-          /etc/init.d/uhttpd start 2>/dev/null
+          
+          # 2. 等待局域网接口 (br-lan) 就绪，最多等 10 秒
+          i=0
+          while [ $i -lt 10 ]; do
+              if ip a show br-lan 2>/dev/null | grep -q "192.168.10.1"; then
+                  break
+              fi
+              sleep 1
+              i=$((i+1))
+          done
+          
+          # 3. 按依赖顺序，稳扎稳打启动服务
+          /etc/init.d/dnsmasq enable 2>/dev/null
+          /etc/init.d/dnsmasq restart 2>/dev/null
+          sleep 2
+          
           /etc/init.d/rpcd enable 2>/dev/null
           /etc/init.d/rpcd start 2>/dev/null
-          /etc/init.d/dnsmasq restart 2>/dev/null
+          sleep 2
+          
+          /etc/init.d/uhttpd enable 2>/dev/null
+          /etc/init.d/uhttpd start 2>/dev/null
+          
           exit 0
           FIRSTBOOT
           chmod +x inject/etc/uci-defaults/00-firstboot
@@ -459,15 +477,14 @@ jobs:
           download_ipk luci luci-i18n-opkg-zh-cn
           download_ipk luci luci-i18n-wifi-zh-cn
           
-          # 【优化】语言包完整性硬校验
           echo ">>> 校验语言包完整性..."
           MISSING=""
           for pkg in luci-lib-i18n luci-i18n-base-zh-cn; do
               [ -f "inject/opt/ipks/${pkg}.ipk" ] || MISSING="${MISSING} ${pkg}"
           done
           if [ -n "$MISSING" ]; then
-              echo "❌ 关键语言包缺失:${MISSING}"
-              exit 1
+            echo "❌ 关键语言包缺失:${MISSING}"
+            exit 1
           fi
           echo "✅ 语言包校验通过"
 
