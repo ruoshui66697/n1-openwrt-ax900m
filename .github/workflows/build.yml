@@ -125,14 +125,25 @@ jobs:
           
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           
-          # 绕过 Kconfig 的自动裁剪，强改 .config 文件
+          # 绕过 Kconfig 的自动裁剪，强改 .config 文件（匹配 not set 和 m 两种情况）
           echo ">>> 强制注入内核配置..."
           sed -i 's/^# CONFIG_WIRELESS is not set/CONFIG_WIRELESS=y/' .config
+          sed -i 's/^CONFIG_WIRELESS=m/CONFIG_WIRELESS=y/' .config
+          
           sed -i 's/^# CONFIG_CFG80211 is not set/CONFIG_CFG80211=y/' .config
+          sed -i 's/^CONFIG_CFG80211=m/CONFIG_CFG80211=y/' .config
+          
           sed -i 's/^# CONFIG_MAC80211 is not set/CONFIG_MAC80211=y/' .config
+          sed -i 's/^CONFIG_MAC80211=m/CONFIG_MAC80211=y/' .config
+          
           sed -i 's/^# CONFIG_RFKILL is not set/CONFIG_RFKILL=y/' .config
+          sed -i 's/^CONFIG_RFKILL=m/CONFIG_RFKILL=y/' .config
+          
           sed -i 's/^# CONFIG_CFG80211_WEXT is not set/CONFIG_CFG80211_WEXT=m/' .config
+          sed -i 's/^CONFIG_CFG80211_WEXT=y/CONFIG_CFG80211_WEXT=m/' .config
+          
           sed -i 's/^# CONFIG_USB_DEVICEFS is not set/CONFIG_USB_DEVICEFS=y/' .config
+          sed -i 's/^CONFIG_USB_DEVICEFS=m/CONFIG_USB_DEVICEFS=y/' .config
           
           # 强制验证
           for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_USB_DEVICEFS; do
@@ -310,7 +321,6 @@ jobs:
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           
-          # 底层 dd 切换脚本
           cat > inject/usr/sbin/switch_card.sh <<'EOF'
           #!/bin/sh
           if [ -x /usr/sbin/usb_modeswitch ]; then
@@ -322,7 +332,6 @@ jobs:
           EOF
           chmod +x inject/usr/sbin/switch_card.sh
 
-          # 【核心修复】hotplug 脚本改用 insmod 加载外部驱动
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
@@ -357,7 +366,6 @@ jobs:
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          # 【核心修复】rc.local 脚本改用 insmod 加载外部驱动
           cat > inject/etc/rc.local <<'EOF'
           #!/bin/sh
           logger -t aic_rc "Starting AX900M detection loop..."
