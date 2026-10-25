@@ -125,7 +125,7 @@ jobs:
           
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           
-          # 绕过 Kconfig 的自动裁剪，强改 .config 文件（匹配 not set 和 m 两种情况）
+          # 绕过 Kconfig 的自动裁剪，强改 .config 文件
           echo ">>> 强制注入内核配置..."
           sed -i 's/^# CONFIG_WIRELESS is not set/CONFIG_WIRELESS=y/' .config
           sed -i 's/^CONFIG_WIRELESS=m/CONFIG_WIRELESS=y/' .config
@@ -142,11 +142,8 @@ jobs:
           sed -i 's/^# CONFIG_CFG80211_WEXT is not set/CONFIG_CFG80211_WEXT=m/' .config
           sed -i 's/^CONFIG_CFG80211_WEXT=y/CONFIG_CFG80211_WEXT=m/' .config
           
-          sed -i 's/^# CONFIG_USB_DEVICEFS is not set/CONFIG_USB_DEVICEFS=y/' .config
-          sed -i 's/^CONFIG_USB_DEVICEFS=m/CONFIG_USB_DEVICEFS=y/' .config
-          
-          # 强制验证
-          for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_USB_DEVICEFS; do
+          # 强制验证 (剔除已废弃的 CONFIG_USB_DEVICEFS)
+          for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_RFKILL; do
             VAL=$(grep "^${opt}=" .config | head -1)
             echo "  $VAL"
             if ! echo "$VAL" | grep -q "=y"; then
