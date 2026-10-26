@@ -86,7 +86,9 @@ jobs:
           	+$(KERNEL_MAKE) $(PKG_JOBS) \
           		M="$(PKG_BUILD_DIR)/drivers/aic8800" \
           		KBUILD_MODPOST_WARN=1 \
+          		KBUILD_EXTRA_SYMBOLS="$(KERNEL_BUILD_DIR)/symvers/mac80211.symvers" \
           		modules
+          	find $(PKG_BUILD_DIR) -name "*.ko" -exec cp {} $(PKG_BUILD_DIR)/drivers/aic8800/ \;
           endef
           
           $(eval $(call KernelPackage,aic8800))
