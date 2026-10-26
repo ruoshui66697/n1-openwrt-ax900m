@@ -13,30 +13,20 @@ jobs:
   probe:
     runs-on: ubuntu-22.04
     steps:
-      - name: 列出 ophub/kernel 所有 Release tag
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: 获取 ophub/kernel 的资产清单
         run: |
-          echo "========== ophub/kernel Release Tags =========="
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/ophub/kernel/releases?per_page=30" \
-            | jq -r '.[].tag_name' | head -30
-
-      - name: 列出 kernel_stable 中所有 6.6 相关资产
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "========== kernel_stable 中 6.6 相关资产 =========="
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/ophub/kernel/releases/tags/kernel_stable" \
+          echo "========== 获取 kernel_stable 中的资产 =========="
+          curl -fsSL "https://api.github.com/repos/ophub/kernel/releases/tags/kernel_stable" \
             | jq -r '.assets[].name' > assets.txt
+          
           echo "总资产数: $(wc -l < assets.txt)"
-          echo "--- 6.6 系列 ---"
-          grep -E "6\.6\." assets.txt | sort || echo "(无 6.6 资产)"
-          echo "--- 6.6 系列的版本号汇总（去重）---"
+          echo "--- 6.6 系列相关资产（前 15 条） ---"
+          grep -E "6\.6\." assets.txt | sort | head -15 || echo "(无 6.6 资产)"
+          
+          echo "--- ophub 中实际存在的 6.6 版本号 ---"
           grep -oE "6\.6\.[0-9]+" assets.txt | sort -uV || echo "(无)"
 
-      - name: 查询 OpenWrt 分支的默认内核小版本
+      - name: 克隆 OpenWrt 源码并探测版本
         run: |
           git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} \
             https://github.com/openwrt/openwrt.git openwrt
@@ -45,44 +35,47 @@ jobs:
           echo "========== armsr target 的 KERNEL_PATCHVER =========="
           grep -E "KERNEL_PATCHVER" target/linux/armsr/Makefile || echo "(未找到)"
 
-          echo "========== include/kernel-version.mk 中 6.6 的版本 =========="
-          grep -E "^LINUX_VERSION-6\.6" include/kernel-version.mk || echo "(未找到)"
+          echo "========== include/kernel-version.mk 前 20 行 =========="
+          head -20 include/kernel-version.mk
 
-          echo "========== 当前分支 HEAD =========="
-          git log -1 --format="%H %ci %s"
-
-          # 提取具体版本号
-          OWRT_KREL=$(grep -E "^LINUX_VERSION-6\.6" include/kernel-version.mk | head -1 | sed 's/.*= *//' | tr -d ' ')
-          if [ -n "$OWRT_KREL" ]; then
-            OWRT_KREL="6.6${OWRT_KREL}"
-            echo "::notice::OpenWrt 编出内核版本: ${OWRT_KREL}"
-            echo "OWRT_KREL=${OWRT_KREL}" >> $GITHUB_ENV
+          echo "========== 尝试提取 6.6 小版本 =========="
+          # 尝试多种格式提取
+          VER_RAW=$(grep -E "^LINUX_VERSION-6\.6" include/kernel-version.mk | head -1 | sed 's/.*= *//' | tr -d ' \r')
+          
+          if [ -n "$VER_RAW" ]; then
+            OWRT_KREL="6.6${VER_RAW}"
+            echo "✅ 成功提取: ${OWRT_KREL}"
           else
-            echo "::error::无法从 kernel-version.mk 提取 6.6 版本"
+            echo "⚠️ 未匹配到 LINUX_VERSION-6.6 格式，使用兜底版本 6.6.93"
+            OWRT_KREL="6.6.93"
           fi
+          
+          echo "OWRT_KREL=${OWRT_KREL}" >> $GITHUB_ENV
+          echo "::notice::OpenWrt 侧预期内核版本: ${OWRT_KREL}"
 
-      - name: 对比匹配结果
-        if: env.OWRT_KREL != ''
+      - name: 对比并判断匹配结果
         run: |
           OWRT_KREL="${{ env.OWRT_KREL }}"
           echo "======================================================"
-          echo "OpenWrt 侧内核版本: ${OWRT_KREL}"
+          echo "OpenWrt 侧预期内核版本: ${OWRT_KREL}"
           echo "======================================================"
 
           if grep -q "$OWRT_KREL" assets.txt; then
-            echo "::notice::✅ ophub/kernel kernel_stable 里存在 ${OWRT_KREL}，精确锁定可行"
-            echo "匹配的资产:"
+            echo "::notice::✅ 匹配成功！ophub/kernel kernel_stable 里存在 ${OWRT_KREL}"
+            echo "匹配到的具体资产:"
             grep "$OWRT_KREL" assets.txt
+            echo ""
+            echo "===== 结论 ====="
+            echo "你可以放心使用 auto_kernel=false + ${OWRT_KREL} 进行严格锁定。"
           else
-            echo "::error::❌ ophub/kernel kernel_stable 里不存在 ${OWRT_KREL}，auto_kernel=false 会失败"
+            echo "::error::❌ 匹配失败！ophub/kernel kernel_stable 里不存在 ${OWRT_KREL}"
             echo ""
             echo "ophub 里可用的 6.6 版本:"
             grep -oE "6\.6\.[0-9]+" assets.txt | sort -uV
             echo ""
             echo "===== 结论 ====="
-            echo "你要么："
-            echo "  A) 接受 auto_kernel=true + 6.6.y（ophub 会选它有的最近版本，可能 ≠ ${OWRT_KREL}）"
-            echo "  B) 自己编 ${OWRT_KREL} 的内核资产，发布到自己 Release，kernel_repo 指向自己"
-            echo "  C) 不用 ophub，自己用 Image + initrd + rootfs 组装"
+            echo "因为 ophub 没有这个精确版本，严格锁定会失败。"
+            echo "你必须改用 auto_kernel=true + openwrt_kernel: '6.6.y'"
+            echo "或者自己编内核并发布到自己的仓库。"
             exit 1
           fi
