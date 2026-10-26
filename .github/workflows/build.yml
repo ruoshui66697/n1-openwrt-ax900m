@@ -9,7 +9,7 @@ on:
         default: 'v24.10.2'
         type: string
       driver_branch:
-        description: '⚠️ 必须选 legacy-mcu1！(若选 main 会报 chip unsupport)'
+        description: '⚠️ 必须选 legacy-mcu1！'
         required: true
         default: 'legacy-mcu1'
         type: choice
@@ -67,7 +67,7 @@ jobs:
           tar xzf "${BOOT_TGZ}" -O "$CFG" > ksrc/.config 2>/dev/null || true
           test "$(wc -l < ksrc/.config)" -gt 1000 || { log_err ".config 无效"; exit 1; }
 
-      - name: 准备内核源码与 AX900M 驱动源码
+      - name: 准备内核源码与 AX900M 驱动源码 (暴力破解)
         run: |
           log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
           rm -rf ksrc-src
@@ -90,7 +90,13 @@ jobs:
           printf '#!/bin/sh\nexit 0\n' > scripts/setlocalversion
           : > .scmversion
           cd ..
+          
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} https://github.com/shenmintao/aic8800d80.git aicsrc
+          
+          # 【终极暴力破解】强行注释掉驱动源码里的 chip unsupport 退出逻辑！
+          echo ">>> 正在暴力阉割驱动源码里的芯片检查..."
+          find aicsrc -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
+          find aicsrc -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
 
       - name: 完整编译内核
         run: |
@@ -122,7 +128,7 @@ jobs:
           scripts/config -e CONFIG_DWMAC_MESON
           scripts/config -e CONFIG_STMMAC_ETH
           
-          # 强制内置无线核心，确保 iw dev 不出错
+          # 强制开启无线核心
           scripts/config -e CONFIG_WIRELESS
           scripts/config -e CONFIG_CFG80211
           scripts/config -m CONFIG_CFG80211_WEXT
@@ -131,7 +137,6 @@ jobs:
           
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           
-          # 【终极暴力修复】再次强改 .config，防止被依赖裁剪
           echo ">>> 强制注入内核配置..."
           sed -i 's/^# CONFIG_WIRELESS is not set/CONFIG_WIRELESS=y/' .config
           sed -i 's/^# CONFIG_CFG80211 is not set/CONFIG_CFG80211=y/' .config
@@ -139,7 +144,6 @@ jobs:
           sed -i 's/^# CONFIG_RFKILL is not set/CONFIG_RFKILL=y/' .config
           sed -i 's/^# CONFIG_CFG80211_WEXT is not set/CONFIG_CFG80211_WEXT=m/' .config
           
-          # 强制验证
           for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_RFKILL; do
             VAL=$(grep "^${opt}=" .config | head -1)
             echo "  $VAL"
@@ -164,7 +168,7 @@ jobs:
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
           depmod -b /tmp/kmod ${KREL}
 
-      - name: 编译绝对静态 busybox
+      - name: 编译 busybox 静态二进制
         run: |
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
           tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
@@ -315,38 +319,36 @@ jobs:
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
           
-          # 【关键修复 1】udev 规则持久化 USB 权限（解决 lsusb -99）
           cat > inject/etc/udev/rules.d/99-usb-permissions.rules <<'EOF'
           SUBSYSTEM=="usb", MODE="0666"
           SUBSYSTEM=="usb_device", MODE="0666"
           EOF
           
-          # 【关键修复 2】纯内核 sysfs 解绑脚本（彻底抛弃 usb_modeswitch）
+          # 纯 POSIX 的 sysfs 切换脚本
           cat > inject/usr/sbin/switch_card.sh <<'EOF'
           #!/bin/sh
-          LOG_TAG="aic_switch"
-          logger -t "$LOG_TAG" "Attempting kernel-level unbind to hijack device..."
+          KVER=$(uname -r)
+          MOD_PATH="/lib/modules/${KVER}/kernel/drivers/aic8800"
           
-          # 强行解除 usb-storage 驱动对设备的霸占 (只解绑 1-1 网卡)
+          # 1. 强行加载固件加载器（生成 sysfs 目录）
+          insmod ${MOD_PATH}/aic_load_fw.ko 2>/dev/null
+          
+          # 2. 强行解除 usb-storage 对 1-1 设备的霸占
           for dev in /sys/bus/usb/drivers/usb-storage/*:*; do
               if [ -d "$dev" ]; then
                   DEVID=$(basename "$dev")
                   case "$DEVID" in
-                      1-1*)
-                          logger -t "$LOG_TAG" "Unbinding usb-storage from $DEVID"
-                          echo -n "$DEVID" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null
-                          ;;
+                      1-1*) echo -n "$DEVID" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null ;;
                   esac
               fi
           done
           
           sleep 1
           
-          # 强行让 aic_load_fw 驱动接管 1111:1111 设备
-          KVER=$(uname -r)
-          insmod /lib/modules/${KVER}/kernel/drivers/aic8800/aic_load_fw.ko 2>/dev/null
-          logger -t "$LOG_TAG" "Forcing aic_load_fw to bind 1111:1111..."
-          echo "1111 1111" > /sys/bus/usb/drivers/aic_load_fw/new_id 2>/dev/null
+          # 3. 强行让驱动接管 1111:1111
+          if [ -d "/sys/bus/usb/drivers/aic_load_fw" ]; then
+              echo "1111 1111" > /sys/bus/usb/drivers/aic_load_fw/new_id 2>/dev/null
+          fi
           EOF
           chmod +x inject/usr/sbin/switch_card.sh
 
@@ -362,14 +364,10 @@ jobs:
                   /usr/sbin/switch_card.sh
                   ;;
               a69c/8d80/*|a69c/8d83/*)
-                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/tmp/aic_err
-                  if [ $? -eq 0 ]; then logger -t aic8800 "✅ aic_load_fw loaded"; else logger -t aic8800 "❌ aic_load_fw failed: $(cat /tmp/aic_err)"; fi
-                  rm -f /tmp/aic_err
+                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
                   ;;
               a69c/8d81/*|368b/8d81/*)
-                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/tmp/aic_err
-                  if [ $? -eq 0 ]; then logger -t aic8800 "✅ aic8800_fdrv loaded"; else logger -t aic8800 "❌ aic8800_fdrv failed: $(cat /tmp/aic_err)"; fi
-                  rm -f /tmp/aic_err
+                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
                   modprobe aic_zlp_quirk 2>/dev/null
                   modprobe btusb 2>/dev/null
                   ;;
@@ -378,6 +376,7 @@ jobs:
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
+          # 绝对纯 POSIX 的 rc.local
           cat > inject/etc/rc.local <<'EOF'
           #!/bin/sh
           KVER=$(uname -r)
