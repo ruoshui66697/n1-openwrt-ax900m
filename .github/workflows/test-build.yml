@@ -1,4 +1,4 @@
-name: 测试 ophub 内核资产与 OpenWrt 版本匹配性
+name: 测试 AIC8800 驱动在 OpenWrt 下的最小编译
 
 on:
   workflow_dispatch:
@@ -8,74 +8,186 @@ on:
         required: true
         default: 'v24.10.2'
         type: string
+      driver_branch:
+        description: 'AIC8800 驱动分支'
+        required: true
+        default: 'legacy-mcu1'
+        type: choice
+        options:
+          - main
+          - legacy-mcu1
 
 jobs:
-  probe:
+  compile:
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
-      - name: 获取 ophub/kernel 的资产清单
+      - name: 安装依赖
         run: |
-          echo "========== 获取 kernel_stable 中的资产 =========="
-          curl -fsSL "https://api.github.com/repos/ophub/kernel/releases/tags/kernel_stable" \
-            | jq -r '.assets[].name' > assets.txt
-          
-          echo "总资产数: $(wc -l < assets.txt)"
-          echo "--- 6.6 系列相关资产（前 15 条） ---"
-          grep -E "6\.6\." assets.txt | sort | head -15 || echo "(无 6.6 资产)"
-          
-          echo "--- ophub 中实际存在的 6.6 版本号 ---"
-          grep -oE "6\.6\.[0-9]+" assets.txt | sort -uV || echo "(无)"
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gettext git libncurses-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            bc libelf-dev kmod bzip2 zstd lz4 u-boot-tools cpio dosfstools \
+            libtool pkg-config autoconf automake jq
 
-      - name: 克隆 OpenWrt 源码并探测版本
+      - name: 克隆 OpenWrt 源码
         run: |
           git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} \
             https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
-          echo "========== armsr target 的 KERNEL_PATCHVER =========="
-          grep -E "KERNEL_PATCHVER" target/linux/armsr/Makefile || echo "(未找到)"
-
-          echo "========== include/kernel-version.mk 前 20 行 =========="
-          head -20 include/kernel-version.mk
-
-          echo "========== 尝试提取 6.6 小版本 =========="
-          # 尝试多种格式提取
-          VER_RAW=$(grep -E "^LINUX_VERSION-6\.6" include/kernel-version.mk | head -1 | sed 's/.*= *//' | tr -d ' \r')
-          
-          if [ -n "$VER_RAW" ]; then
-            OWRT_KREL="6.6${VER_RAW}"
-            echo "✅ 成功提取: ${OWRT_KREL}"
-          else
-            echo "⚠️ 未匹配到 LINUX_VERSION-6.6 格式，使用兜底版本 6.6.93"
-            OWRT_KREL="6.6.93"
-          fi
-          
-          echo "OWRT_KREL=${OWRT_KREL}" >> $GITHUB_ENV
-          echo "::notice::OpenWrt 侧预期内核版本: ${OWRT_KREL}"
-
-      - name: 对比并判断匹配结果
+      - name: 注入 AIC8800 Package（与主 Workflow 完全一致的 Makefile）
         run: |
-          OWRT_KREL="${{ env.OWRT_KREL }}"
-          echo "======================================================"
-          echo "OpenWrt 侧预期内核版本: ${OWRT_KREL}"
-          echo "======================================================"
+          cd openwrt
+          mkdir -p package/kernel/aic8800
+          git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
+            https://github.com/shenmintao/aic8800d80.git \
+            package/kernel/aic8800/src
 
-          if grep -q "$OWRT_KREL" assets.txt; then
-            echo "::notice::✅ 匹配成功！ophub/kernel kernel_stable 里存在 ${OWRT_KREL}"
-            echo "匹配到的具体资产:"
-            grep "$OWRT_KREL" assets.txt
-            echo ""
-            echo "===== 结论 ====="
-            echo "你可以放心使用 auto_kernel=false + ${OWRT_KREL} 进行严格锁定。"
+          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
+          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
+
+          cat > package/kernel/aic8800/Makefile <<'MAKEFILE'
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=aic8800
+PKG_VERSION:=2026.01.01
+PKG_RELEASE:=1
+
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/shenmintao/aic8800d80.git
+PKG_SOURCE_VERSION:=${{ github.event.inputs.driver_branch }}
+
+PKG_MAINTAINER:=Custom Build
+PKG_LICENSE:=GPL-2.0
+
+include $(INCLUDE_DIR)/kernel.mk
+
+define KernelPackage/aic8800
+  SUBMENU:=Wireless Drivers
+  TITLE:=AIC8800 USB WiFi driver
+  DEPENDS:=+kmod-cfg80211 +kmod-mac80211 +kmod-usb-core
+  FILES:= \
+	$(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko \
+	$(PKG_BUILD_DIR)/drivers/aic8800/aic8800_fdrv.ko
+  AUTOLOAD:=$(call AutoProbe,aic8800_fdrv aic_load_fw)
+endef
+
+define KernelPackage/aic8800/description
+  Out-of-tree AIC8800 USB WiFi driver for OpenWrt backports stack.
+endef
+
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/. $(PKG_BUILD_DIR)/
+endef
+
+define Build/Compile
+	+$(KERNEL_MAKE) $(PKG_JOBS) \
+		M="$(PKG_BUILD_DIR)/drivers/aic8800" \
+		modules
+endef
+
+$(eval $(call KernelPackage,aic8800))
+MAKEFILE
+
+      - name: 生成最小配置
+        run: |
+          cd openwrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_armsr=y
+          CONFIG_TARGET_armsr_armv8=y
+          CONFIG_PACKAGE_kmod-cfg80211=y
+          CONFIG_PACKAGE_kmod-mac80211=y
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_kmod-aic8800=y
+          EOF
+          make defconfig
+
+      - name: 校验 package 是否被正确识别
+        run: |
+          cd openwrt
+          echo "========== package 列表中的 aic8800 =========="
+          make package/kernel/aic8800/compile V=s 2>&1 | head -5 || true
+
+          echo "========== defconfig 中的 kmod-aic8800 =========="
+          grep "CONFIG_PACKAGE_kmod-aic8800" .config
+          if grep -q "CONFIG_PACKAGE_kmod-aic8800=y" .config; then
+            echo "::notice::✅ kmod-aic8800 被 Kconfig 正确识别为 =y"
           else
-            echo "::error::❌ 匹配失败！ophub/kernel kernel_stable 里不存在 ${OWRT_KREL}"
-            echo ""
-            echo "ophub 里可用的 6.6 版本:"
-            grep -oE "6\.6\.[0-9]+" assets.txt | sort -uV
-            echo ""
-            echo "===== 结论 ====="
-            echo "因为 ophub 没有这个精确版本，严格锁定会失败。"
-            echo "你必须改用 auto_kernel=true + openwrt_kernel: '6.6.y'"
-            echo "或者自己编内核并发布到自己的仓库。"
+            echo "::error::❌ kmod-aic8800 未被识别，Makefile 可能有语法错"
             exit 1
           fi
+
+      - name: 编译 toolchain
+        run: |
+          cd openwrt
+          make toolchain/install -j$(nproc) V=s 2>&1 | tail -50
+
+      - name: 编译 kernel
+        run: |
+          cd openwrt
+          make target/linux/compile -j$(nproc) V=s 2>&1 | tail -50
+
+      - name: 提取实际内核版本
+        run: |
+          cd openwrt
+          KREL=$(cat staging_dir/target-*/include/config/kernel.release 2>/dev/null | head -1)
+          if [ -z "$KREL" ]; then
+            KREL=$(make -s kernelversion 2>/dev/null)
+          fi
+          echo "KREL=${KREL}" >> $GITHUB_ENV
+          echo "::notice::OpenWrt 实际编译内核版本 = ${KREL}"
+
+      - name: 编译 AIC8800 驱动
+        run: |
+          cd openwrt
+          make package/kernel/aic8800/compile -j$(nproc) V=s 2>&1 | tee /tmp/aic8800-build.log | tail -100
+
+          if grep -qE "Error [0-9]+|error:" /tmp/aic8800-build.log; then
+            echo "::error::❌ AIC8800 编译失败，见上方日志"
+            exit 1
+          fi
+          echo "::notice::✅ AIC8800 驱动编译成功"
+
+      - name: 检查 .ko 产物
+        run: |
+          cd openwrt
+          echo "========== 编译产物 .ko =========="
+          find build_dir/target-*/linux-*/ -name "*.ko" -path "*aic8800*" 2>/dev/null || true
+          find staging_dir/target-*/ -name "*aic8800*" 2>/dev/null || true
+
+          KO=$(find build_dir/target-*/ -name "aic8800_fdrv.ko" 2>/dev/null | head -1)
+          if [ -n "$KO" ]; then
+            echo "::notice::✅ 找到 aic8800_fdrv.ko: $KO"
+            file "$KO"
+          else
+            echo "::error::❌ 未找到 aic8800_fdrv.ko，编译可能静默失败"
+            exit 1
+          fi
+
+      - name: 检查 IPK 包
+        run: |
+          cd openwrt
+          IPK=$(find bin/ -name "kmod-aic8800*.ipk" 2>/dev/null | head -1)
+          if [ -n "$IPK" ]; then
+            echo "::notice::✅ IPK 生成成功: $IPK"
+            ls -la "$IPK"
+          else
+            echo "::warning::未在 bin/ 中找到 kmod-aic8800*.ipk（可能未触发打包阶段）"
+          fi
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aic8800-build-log
+          path: |
+            /tmp/aic8800-build.log
+            openwrt/logs/
+          retention-days: 7
+          if-no-files-found: ignore
