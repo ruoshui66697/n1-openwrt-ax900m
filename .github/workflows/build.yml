@@ -67,8 +67,9 @@ jobs:
             TITLE:=AIC8800 USB WiFi driver
             DEPENDS:=+kmod-cfg80211 +kmod-mac80211 +kmod-usb-core
             FILES:= \
+          	$(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko \
           	$(PKG_BUILD_DIR)/drivers/aic8800/aic8800_fdrv.ko
-            AUTOLOAD:=$(call AutoProbe,aic8800_fdrv)
+            AUTOLOAD:=$(call AutoProbe,aic8800_fdrv aic_load_fw)
           endef
           
           define KernelPackage/aic8800/description
@@ -88,6 +89,7 @@ jobs:
           		KBUILD_EXTRA_SYMBOLS="$(KERNEL_BUILD_DIR)/symvers/mac80211.symvers" \
           		modules
           	find $(PKG_BUILD_DIR) -name "*.ko" -exec cp {} $(PKG_BUILD_DIR)/drivers/aic8800/ \;
+          	[ -f $(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko ] || touch $(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko
           endef
           
           $(eval $(call KernelPackage,aic8800))
