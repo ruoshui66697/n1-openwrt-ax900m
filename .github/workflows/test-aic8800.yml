@@ -1,0 +1,98 @@
+name: 测试 AIC8800 最小编译
+
+on:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync \
+            swig unzip zlib1g-dev file wget bc libelf-dev kmod bzip2 zstd \
+            lz4 u-boot-tools cpio dosfstools libtool pkg-config autoconf automake jq
+
+      - name: 克隆 OpenWrt 源码
+        run: |
+          git clone --depth 1 --branch v24.10.2 https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 注入 AIC8800 Package
+        run: |
+          cd openwrt
+          mkdir -p package/kernel/aic8800
+          git clone --depth 1 --branch legacy-mcu1 https://github.com/shenmintao/aic8800d80.git package/kernel/aic8800/src
+
+          cat > package/kernel/aic8800/Makefile <<'MAKEFILE'
+          include $(TOPDIR)/rules.mk
+
+          PKG_NAME:=aic8800
+          PKG_VERSION:=2026.01.01
+          PKG_RELEASE:=1
+          PKG_SOURCE_PROTO:=git
+          PKG_SOURCE_URL:=https://github.com/shenmintao/aic8800d80.git
+          PKG_SOURCE_VERSION:=legacy-mcu1
+          PKG_MAINTAINER:=Custom Build
+          PKG_LICENSE:=GPL-2.0
+
+          include $(INCLUDE_DIR)/kernel.mk
+
+          define KernelPackage/aic8800
+            SUBMENU:=Wireless Drivers
+            TITLE:=AIC8800 USB WiFi driver
+            DEPENDS:=+kmod-cfg80211 +kmod-mac80211 +kmod-usb-core
+            FILES:= \
+          	$(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko \
+          	$(PKG_BUILD_DIR)/drivers/aic8800/aic8800_fdrv.ko
+            AUTOLOAD:=$(call AutoProbe,aic8800_fdrv aic_load_fw)
+          endef
+
+          define KernelPackage/aic8800/description
+            Out-of-tree AIC8800 USB WiFi driver for OpenWrt backports stack.
+          endef
+
+          define Build/Prepare
+          	$(call Build/Prepare/Default)
+          	mkdir -p $(PKG_BUILD_DIR)
+          	$(CP) ./src/. $(PKG_BUILD_DIR)/
+          endef
+
+          define Build/Compile
+          	+$(KERNEL_MAKE) $(PKG_JOBS) \
+          		M="$(PKG_BUILD_DIR)/drivers/aic8800" \
+          		modules
+          endef
+
+          $(eval $(call KernelPackage,aic8800))
+          MAKEFILE
+
+      - name: 生成最小配置
+        run: |
+          cd openwrt
+          cat > .config <<'EOF'
+          CONFIG_TARGET_armsr=y
+          CONFIG_TARGET_armsr_armv8=y
+          CONFIG_PACKAGE_kmod-cfg80211=y
+          CONFIG_PACKAGE_kmod-mac80211=y
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_kmod-aic8800=y
+          EOF
+          make defconfig
+
+      - name: 编译内核与 AIC8800 驱动
+        run: |
+          cd openwrt
+          make toolchain/install -j$(nproc) V=s
+          make target/linux/compile -j$(nproc) V=s
+          make package/kernel/aic8800/compile -j$(nproc) V=s
+
+      - name: 检查编译产物
+        run: |
+          cd openwrt
+          find build_dir/target-*/ -name "aic8800_fdrv.ko"
