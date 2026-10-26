@@ -27,21 +27,22 @@ jobs:
         run: |
           cd openwrt
           mkdir -p package/kernel/aic8800
+          # 拉取源码到 src 目录
           git clone --depth 1 --branch legacy-mcu1 https://github.com/shenmintao/aic8800d80.git package/kernel/aic8800/src
 
+          # 暴力破解芯片检查（放在 Makefile 写入之前）
+          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
+          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
+
+          # 写入正确的 Makefile
           cat > package/kernel/aic8800/Makefile <<'MAKEFILE'
           include $(TOPDIR)/rules.mk
+          include $(INCLUDE_DIR)/kernel.mk
+          include $(INCLUDE_DIR)/package.mk
 
           PKG_NAME:=aic8800
-          PKG_VERSION:=2026.01.01
           PKG_RELEASE:=1
-          PKG_SOURCE_PROTO:=git
-          PKG_SOURCE_URL:=https://github.com/shenmintao/aic8800d80.git
-          PKG_SOURCE_VERSION:=legacy-mcu1
-          PKG_MAINTAINER:=Custom Build
-          PKG_LICENSE:=GPL-2.0
-
-          include $(INCLUDE_DIR)/kernel.mk
+          PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
 
           define KernelPackage/aic8800
             SUBMENU:=Wireless Drivers
@@ -54,11 +55,11 @@ jobs:
           endef
 
           define KernelPackage/aic8800/description
-            Out-of-tree AIC8800 USB WiFi driver for OpenWrt backports stack.
+            Out-of-tree AIC8800 USB WiFi driver.
           endef
 
           define Build/Prepare
-          	$(call Build/Prepare/Default)
+          	rm -rf $(PKG_BUILD_DIR)
           	mkdir -p $(PKG_BUILD_DIR)
           	$(CP) ./src/. $(PKG_BUILD_DIR)/
           endef
@@ -88,8 +89,10 @@ jobs:
       - name: 编译内核与 AIC8800 驱动
         run: |
           cd openwrt
+          # 先编内核和工具链（如果上次跑过，这里会非常快，因为日志证明内核已经OK了）
           make toolchain/install -j$(nproc) V=s
           make target/linux/compile -j$(nproc) V=s
+          # 编译 AIC8800 模块
           make package/kernel/aic8800/compile -j$(nproc) V=s
 
       - name: 检查编译产物
