@@ -93,7 +93,7 @@ jobs:
           
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} https://github.com/shenmintao/aic8800d80.git aicsrc
           
-          # 【终极暴力破解】强行注释掉驱动源码里的 chip unsupport 退出逻辑！
+          # 【暴力破解】强行注释掉驱动源码里的 chip unsupport 退出逻辑
           echo ">>> 正在暴力阉割驱动源码里的芯片检查..."
           find aicsrc -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
           find aicsrc -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
@@ -318,41 +318,39 @@ jobs:
         run: |
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
-          
-          # 1. 写入官方配置文件（备用，虽然主要用 sg_raw 了）
-          cat > inject/etc/usb_modeswitch.d/1111:1111 <<'EOF'
-          DefaultVendor=0x1111
-          DefaultProduct=0x1111
-          TargetVendor=0xa69c
-          TargetProduct=0x8d81
-          MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
-          EOF
+          cp usb_modeswitch inject/usr/sbin/
+          chmod +x inject/usr/sbin/usb_modeswitch
           
           cat > inject/etc/udev/rules.d/99-usb-permissions.rules <<'EOF'
           SUBSYSTEM=="usb", MODE="0666"
           SUBSYSTEM=="usb_device", MODE="0666"
           EOF
           
-          # 2. 纯 POSIX 的 sg_raw 切换脚本
+          # 纯内核 sysfs 解绑脚本（放弃 usb_modeswitch）
           cat > inject/usr/sbin/switch_card.sh <<'EOF'
           #!/bin/sh
-          LOG_TAG="aic_switch"
+          KVER=$(uname -r)
+          MOD_PATH="/lib/modules/${KVER}/kernel/drivers/aic8800"
           
-          for sd in /sys/block/sd*; do
-              SIZE=$(cat $sd/size 2>/dev/null)
-              if [ "$SIZE" = "7944" ]; then
-                  DEVNAME="/dev/$(basename $sd)"
-                  logger -t "$LOG_TAG" "Found AX900M at $DEVNAME, sending SCSI commands..."
-                  if [ -x /usr/bin/sg_raw ]; then
-                      sg_raw -s 31 -b "$DEVNAME" 55 53 42 43 12 34 56 78 00 00 00 00 00 00 10 fd 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f3 >/dev/null 2>&1
-                      sleep 1
-                      sg_raw -s 31 -b "$DEVNAME" 55 53 42 43 12 34 56 78 00 00 00 00 00 00 10 fd 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f2 >/dev/null 2>&1
-                      logger -t "$LOG_TAG" "SCSI commands sent."
-                  else
-                      logger -t "$LOG_TAG" "sg_raw not found!"
-                  fi
+          # 1. 强行加载固件加载器
+          insmod ${MOD_PATH}/aic_load_fw.ko 2>/dev/null
+          
+          # 2. 强行解除 usb-storage 对 1-1 设备的霸占
+          for dev in /sys/bus/usb/drivers/usb-storage/*:*; do
+              if [ -d "$dev" ]; then
+                  DEVID=$(basename "$dev")
+                  case "$DEVID" in
+                      1-1*) echo -n "$DEVID" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null ;;
+                  esac
               fi
           done
+          
+          sleep 1
+          
+          # 3. 强行让驱动接管 1111:1111
+          if [ -d "/sys/bus/usb/drivers/aic_load_fw" ]; then
+              echo "1111 1111" > /sys/bus/usb/drivers/aic_load_fw/new_id 2>/dev/null
+          fi
           EOF
           chmod +x inject/usr/sbin/switch_card.sh
 
@@ -368,7 +366,6 @@ jobs:
                   /usr/sbin/switch_card.sh
                   ;;
               a69c/8d81/*|368b/8d81/*)
-                  logger -t aic8800 "WiFi Mode Detected! Loading Firmware..."
                   insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
                   insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
                   modprobe btusb 2>/dev/null
@@ -378,12 +375,9 @@ jobs:
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          # 3. 修正密码空问题并加轮询兜底
+          # 纯 POSIX 的 rc.local
           cat > inject/etc/rc.local <<'EOF'
           #!/bin/sh
-          # 强制修复密码为空的问题
-          echo "root:password" | chpasswd
-          
           KVER=$(uname -r)
           MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
           i=0
@@ -437,9 +431,20 @@ jobs:
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > inject/etc/uci-defaults/99-set-lan-ip
           chmod +x inject/etc/uci-defaults/99-set-lan-ip
           
+          # 【核心修复】直接覆盖 /etc/shadow 文件彻底解决密码为空的问题！
+          # 生成 root 密码为 'password' 的 shadow 文件
+          mkdir -p inject/etc
+          cat > inject/etc/shadow <<'EOF'
+          root:$1$password$wT.S4W5vH9OaT8mXoP.cU0:19000:0:99999:7:::
+          daemon:*:0:0:99999:7:::
+          ftp:*:0:0:99999:7:::
+          network:*:0:0:99999:7:::
+          nobody:*:0:0:99999:7:::
+          dnsmasq:x:0:0:99999:7:::
+          EOF
+          
           cat > inject/etc/uci-defaults/00-firstboot <<'FIRSTBOOT'
           #!/bin/sh
-          echo "root:password" | chpasswd
           
           /etc/init.d/usbfs enable 2>/dev/null
           /etc/init.d/usbfs start 2>/dev/null
@@ -562,9 +567,6 @@ jobs:
           CONFIG_PACKAGE_kmod-cfg80211=y
           CONFIG_PACKAGE_kmod-mac80211=y
           CONFIG_PACKAGE_libusb-1.0=y
-          
-          # 【新增】底层 SCSI 工具，用于 sg_raw 强制切换
-          CONFIG_PACKAGE_sg3-utils=y
           EOF
           make defconfig
 
