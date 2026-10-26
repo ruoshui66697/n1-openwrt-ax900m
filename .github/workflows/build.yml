@@ -49,19 +49,19 @@ jobs:
           cd openwrt
           mkdir -p package/kernel/aic8800
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} https://github.com/shenmintao/aic8800d80.git package/kernel/aic8800/src
-
+          
           find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
           find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
-
+          
           cat > package/kernel/aic8800/Makefile <<'MAKEFILE'
           include $(TOPDIR)/rules.mk
           include $(INCLUDE_DIR)/kernel.mk
           include $(INCLUDE_DIR)/package.mk
-
+          
           PKG_NAME:=aic8800
           PKG_RELEASE:=1
           PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
-
+          
           define KernelPackage/aic8800
             SUBMENU:=Wireless Drivers
             TITLE:=AIC8800 USB WiFi driver
@@ -71,23 +71,24 @@ jobs:
           	$(PKG_BUILD_DIR)/drivers/aic8800/aic8800_fdrv.ko
             AUTOLOAD:=$(call AutoProbe,aic8800_fdrv aic_load_fw)
           endef
-
+          
           define KernelPackage/aic8800/description
             Out-of-tree AIC8800 USB WiFi driver.
           endef
-
+          
           define Build/Prepare
           	rm -rf $(PKG_BUILD_DIR)
           	mkdir -p $(PKG_BUILD_DIR)
           	$(CP) ./src/. $(PKG_BUILD_DIR)/
           endef
-
+          
           define Build/Compile
           	+$(KERNEL_MAKE) $(PKG_JOBS) \
           		M="$(PKG_BUILD_DIR)/drivers/aic8800" \
+          		KBUILD_MODPOST_WARN=1 \
           		modules
           endef
-
+          
           $(eval $(call KernelPackage,aic8800))
           MAKEFILE
 
@@ -134,7 +135,7 @@ jobs:
           rm -rf staging_dir/host staging_dir/toolchain-* build_dir/toolchain-* build_dir/host
           make defconfig
 
-      - name: 临时修复 cp 兼容性 Bug
+      - name: 修复 cp 兼容性
         run: |
           sudo mv /usr/bin/cp /usr/bin/cp.orig
           sudo tee /usr/bin/cp > /dev/null <<'EOF'
@@ -149,19 +150,32 @@ jobs:
           EOF
           sudo chmod +x /usr/bin/cp
 
-      - name: 编译 OpenWrt rootfs
+      - name: 编译 OpenWrt
         run: |
           cd openwrt
-          make -j3 2>>"$ERR_FILE" || make -j1 V=s 2>&1 | tee -a "$ERR_FILE"
+          if ! make -j3 2>>"$ERR_FILE"; then
+            echo "❌ 并发编译失败，尝试单线程排查..."
+            make -j1 V=s 2>&1 | tee -a "$ERR_FILE"
+            exit 1
+          fi
 
       - name: 提取内核并发布到当前仓库 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd openwrt
-          KREL=$(ls staging_dir/target-*/lib/modules/ | grep -E "^6" | head -n 1)
+          KREL=$(ls staging_dir/target-*/lib/modules/ 2>/dev/null | grep -E "^6" | head -n 1)
+          if [ -z "$KREL" ]; then
+             echo "❌ 找不到内核模块目录，编译失败！"
+             exit 1
+          fi
           echo "KREL=${KREL}" >> $GITHUB_ENV
+          
           LINUX_DIR=$(find build_dir/target-*/linux-*/linux-* -maxdepth 0 -type d | head -n 1)
+          if [ ! -d "$LINUX_DIR" ]; then
+             echo "❌ 找不到 Linux 编译目录！"
+             exit 1
+          fi
           
           mkdir -p /tmp/custom_kernel/boot /tmp/custom_kernel/dtb /tmp/custom_kernel/modules
           cp "$LINUX_DIR/arch/arm64/boot/Image" /tmp/custom_kernel/boot/
@@ -232,7 +246,12 @@ jobs:
           MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
           case "$PRODUCT" in
               1111/1111/*) sleep 2; /usr/sbin/switch_card.sh ;;
-              a69c/8d81/*|368b/8d81/*) insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null; insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null; modprobe btusb 2>/dev/null ;;
+              a69c/8d81/*|368b/8d81/*) 
+                  modprobe cfg80211 2>/dev/null
+                  modprobe mac80211 2>/dev/null
+                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
+                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
+                  modprobe btusb 2>/dev/null ;;
           esac
           exit 0
           EOF
@@ -245,8 +264,11 @@ jobs:
           i=0
           while [ $i -lt 20 ]; do
               if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
+                  modprobe cfg80211 2>/dev/null
+                  modprobe mac80211 2>/dev/null
                   insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
-                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null; break
+                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
+                  break
               fi
               if grep -q "1111" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then /usr/sbin/switch_card.sh; fi
               sleep 3; i=$((i+3))
@@ -313,7 +335,7 @@ jobs:
           
           if [ "$JOB_STATUS" = "success" ]; then
             TITLE="[openwrt N1] ✅ 构建成功 (内核: $KERNEL_VER)"
-            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER。去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
+            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER。去 Actions 下载刷机即可。"
           else
             TITLE="[openwrt N1] ❌ 构建失败"
             ERR_SUMMARY=""
@@ -339,8 +361,3 @@ jobs:
 
           RESPONSE=$(curl -sS -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD")
           echo "钉钉接口返回: $RESPONSE"
-          if echo "$RESPONSE" | grep -q '"errcode":0'; then
-            echo "✅ 钉钉通知发送成功"
-          else
-            echo "❌ 钉钉通知发送失败"
-          fi
