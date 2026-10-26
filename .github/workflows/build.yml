@@ -335,22 +335,13 @@ jobs:
           cp usb_modeswitch inject/usr/sbin/
           chmod +x inject/usr/sbin/usb_modeswitch
           
-          # 1. 写入官方配置文件
-          cat > inject/etc/usb_modeswitch.d/1111:1111 <<'EOF'
-          DefaultVendor=0x1111
-          DefaultProduct=0x1111
-          TargetVendor=0xa69c
-          TargetProduct=0x8d81
-          MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
-          EOF
-          
-          # 2. 纯净的 udev 规则
+          # 1. 纯净的 udev 规则，确保 lsusb 和 usb_modeswitch 正常
           cat > inject/etc/udev/rules.d/99-usb-permissions.rules <<'EOF'
           SUBSYSTEM=="usb", MODE="0666"
           SUBSYSTEM=="usb_device", MODE="0666"
           EOF
           
-          # 3. 切换脚本 (直接调用 usb_modeswitch 读取配置)
+          # 2. 切换脚本：硬编码双指令（F3 + F2），解决配置文件失效问题
           cat > inject/usr/sbin/switch_card.sh <<'EOF'
           #!/bin/sh
           LOCK_FILE="/tmp/.aic8800_switching"
@@ -358,13 +349,18 @@ jobs:
           touch "$LOCK_FILE"
           
           chmod 666 /dev/bus/usb/*/* 2>/dev/null
-          /usr/sbin/usb_modeswitch -W -c /etc/usb_modeswitch.d/1111:1111 >/dev/null 2>&1
+          
+          # 使用明确的 F3 和 F2 序列进行切换（针对 1111:1111）
+          /usr/sbin/usb_modeswitch -v 1111 -p 1111 -W -D -R \
+            -M "555342438765432100000000000010fd0000000000000000000000000000f3" \
+            -2 "555342438765432100000000000010fd0000000000000000000000000000f2" \
+            >/tmp/switch_log 2>&1
           
           rm -f "$LOCK_FILE"
           EOF
           chmod +x inject/usr/sbin/switch_card.sh
 
-          # 4. 热插拔脚本
+          # 3. 热插拔脚本：加入 3 次重试机制，解决 USB 枚举竞态
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
@@ -373,11 +369,22 @@ jobs:
           
           case "$PRODUCT" in
               1111/1111/*)
-                  sleep 2
-                  /usr/sbin/switch_card.sh
+                  # 重试机制：最多尝试3次，每次间隔2秒
+                  for i in 1 2 3; do
+                      sleep 2
+                      /usr/sbin/switch_card.sh
+                      if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
+                          logger -t aic8800 "Mode switch succeeded on attempt $i"
+                          insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
+                          insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
+                          modprobe btusb 2>/dev/null
+                          exit 0
+                      fi
+                  done
+                  logger -t aic8800 "Mode switch failed after 3 attempts"
                   ;;
               a69c/8d81/*|368b/8d81/*)
-                  logger -t aic8800 "WiFi Mode Detected! Loading Firmware..."
+                  logger -t aic8800 "WiFi mode detected, loading drivers..."
                   insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
                   insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
                   modprobe btusb 2>/dev/null
@@ -387,14 +394,14 @@ jobs:
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          # 5. rc.local 轮询兜底
+          # 4. rc.local 轮询兜底
           cat > inject/etc/rc.local <<'EOF'
           #!/bin/sh
           KVER=$(uname -r)
           MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
           i=0
           while [ $i -lt 20 ]; do
-              if grep -qiE "a69c/8d81|368b/8d81" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
+              if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
                   insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
                   insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
                   break
