@@ -1,4 +1,4 @@
-name: N1 OpenWrt AX900M 固件编译
+name: N1 OpenWrt AX900M 固件编译 (内核严格一致版)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         default: 'v24.10.2'
         type: string
       driver_branch:
-        description: '⚠️ 必须选 legacy-mcu1！'
+        description: 'AIC8800 驱动分支 (legacy-mcu1 为 AX900M 专用)'
         required: true
         default: 'legacy-mcu1'
         type: choice
@@ -34,7 +34,7 @@ jobs:
           echo "Run: ${{ github.run_id }}" >> "$ERR_FILE"
           echo "========================" >> "$ERR_FILE"
           echo "ERR_FILE=$ERR_FILE" >> $GITHUB_ENV
-          
+
           if ! git ls-remote --heads https://github.com/shenmintao/aic8800d80.git | grep -q "refs/heads/${{ github.event.inputs.driver_branch }}"; then
             echo "[❌] 驱动分支 ${{ github.event.inputs.driver_branch }} 不存在，请检查输入！"
             exit 1
@@ -50,484 +50,71 @@ jobs:
             zstd lz4 u-boot-tools cpio dosfstools \
             libtool pkg-config autoconf automake jq
 
-      - name: 查询 flippy 内核版本并获取内核配置
-        run: |
-          log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          KV=$(curl -fsSL "https://github.com/ophub/kernel/releases/expanded_assets/kernel_stable" | sed -n 's/.*6\.12\.\([0-9]\+\)\.tar\.gz.*/\1/p' | sort -un | tail -1 || true)
-          test -n "$KV" || { log_err "查询 flippy 内核版本失败"; exit 1; }
-          echo "KV=6.12.${KV}" >> $GITHUB_ENV
-          curl -fsSL "https://github.com/ophub/kernel/releases/download/kernel_stable/6.12.${KV}.tar.gz" -o /tmp/k.tar.gz
-          tar xzf /tmp/k.tar.gz -C /tmp
-          BOOT_TGZ=$(find /tmp -maxdepth 2 -name 'boot-*.tar.gz' 2>/dev/null | head -1 || true)
-          test -n "$BOOT_TGZ" || { log_err "内核包结构异常"; exit 1; }
-          tar tzf "${BOOT_TGZ}" > /tmp/bootlist 2>/dev/null || true
-          CFG=$(grep -m1 -i '^config' /tmp/bootlist 2>/dev/null || true)
-          test -n "$CFG" || { log_err "boot 包里没有 config 文件"; exit 1; }
-          mkdir -p ksrc
-          tar xzf "${BOOT_TGZ}" -O "$CFG" > ksrc/.config 2>/dev/null || true
-          test "$(wc -l < ksrc/.config)" -gt 1000 || { log_err ".config 无效"; exit 1; }
-
-      - name: 准备内核源码与 AX900M 驱动源码 (暴力破解)
-        run: |
-          log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          rm -rf ksrc-src
-          git clone --depth 100 https://github.com/unifreq/linux-6.12.y.git ksrc-src
-          cd ksrc-src
-          KV="${{ env.KV }}"
-          MATCHED=""
-          for c in $(git rev-list -n 100 HEAD); do
-            V=$(git show "$c:Makefile" 2>/dev/null | awk -F'= ' '/^(VERSION|PATCHLEVEL|SUBLEVEL) =/{printf "%s.", $2}' | sed 's/\.$//')
-            if [ "$V" = "$KV" ]; then
-              [ "$c" != "$(git rev-parse HEAD)" ] && git checkout -q "$c"
-              MATCHED=1
-              break
-            fi
-          done
-          test -n "$MATCHED" || { log_err "未找到与 flippy 内核 $KV 匹配的提交"; exit 1; }
-          rm -f .config
-          mv ../ksrc/.config .
-          scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
-          printf '#!/bin/sh\nexit 0\n' > scripts/setlocalversion
-          : > .scmversion
-          cd ..
-          
-          git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} https://github.com/shenmintao/aic8800d80.git aicsrc
-          
-          # 【暴力破解】强行注释掉驱动源码里的 chip unsupport 退出逻辑
-          echo ">>> 正在暴力阉割驱动源码里的芯片检查..."
-          find aicsrc -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
-          find aicsrc -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
-
-      - name: 完整编译内核
-        run: |
-          log_err() { echo "[❌ $(date '+%H:%M:%S')] $1" | tee -a "$ERR_FILE" >&2; }
-          cd ksrc-src
-          KV="${{ env.KV }}"
-          
-          scripts/config -e CONFIG_BLK_DEV_SD
-          scripts/config -e CONFIG_BLK_DEV_SR
-          scripts/config -e CONFIG_USB_STORAGE
-          scripts/config -e CONFIG_USB_UAS
-          scripts/config -e CONFIG_SCSI_MOD
-          scripts/config -e CONFIG_SCSI
-          scripts/config -e CONFIG_EXT4_FS
-          scripts/config -e CONFIG_BTRFS_FS
-          scripts/config -e CONFIG_FAT_FS
-          scripts/config -e CONFIG_VFAT_FS
-          scripts/config -e CONFIG_NLS_UTF8
-          
-          scripts/config -e CONFIG_USB_XHCI_HCD
-          scripts/config -e CONFIG_USB_EHCI_HCD
-          scripts/config -e CONFIG_USB_DWC3
-          scripts/config -e CONFIG_USB_DWC3_MESON_GXL
-          scripts/config -e CONFIG_USB_XHCI_PLATFORM
-          
-          scripts/config -e CONFIG_NET_VENDOR_REALTEK
-          scripts/config -e CONFIG_REALTEK_PHY
-          scripts/config -e CONFIG_MDIO_BUS_MUX_MESON_GXL
-          scripts/config -e CONFIG_DWMAC_MESON
-          scripts/config -e CONFIG_STMMAC_ETH
-          
-          # 强制开启无线核心
-          scripts/config -e CONFIG_WIRELESS
-          scripts/config -e CONFIG_CFG80211
-          scripts/config -m CONFIG_CFG80211_WEXT
-          scripts/config -e CONFIG_MAC80211
-          scripts/config -e CONFIG_RFKILL
-          
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          
-          echo ">>> 强制注入内核配置..."
-          sed -i 's/^# CONFIG_WIRELESS is not set/CONFIG_WIRELESS=y/' .config
-          sed -i 's/^# CONFIG_CFG80211 is not set/CONFIG_CFG80211=y/' .config
-          sed -i 's/^# CONFIG_MAC80211 is not set/CONFIG_MAC80211=y/' .config
-          sed -i 's/^# CONFIG_RFKILL is not set/CONFIG_RFKILL=y/' .config
-          sed -i 's/^# CONFIG_CFG80211_WEXT is not set/CONFIG_CFG80211_WEXT=m/' .config
-          
-          for opt in CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_WIRELESS CONFIG_RFKILL; do
-            VAL=$(grep "^${opt}=" .config | head -1)
-            echo "  $VAL"
-            if ! echo "$VAL" | grep -q "=y"; then
-              log_err "${opt} 强制写入失败！请检查"
-              exit 1
-            fi
-          done
-          
-          V=$(awk '/^VERSION = /{print $3}' Makefile)
-          P=$(awk '/^PATCHLEVEL = /{print $3}' Makefile)
-          S=$(awk '/^SUBLEVEL = /{print $3}' Makefile)
-          KREL="${V}.${P}.${S}"
-          echo "KREL=${KREL}" >> $GITHUB_ENV
-          test "$KREL" = "$KV" || { log_err "KREL($KREL) 与 flippy KV($KV) 不一致"; exit 1; }
-          
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image modules dtbs 2>>"$ERR_FILE"
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=/tmp/kmod INSTALL_MOD_STRIP=1 KERNELRELEASE="${KREL}" DEPMOD=true modules_install
-          
-          mkdir -p /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=$PWD/../aicsrc/drivers/aic8800 modules 2>>"$ERR_FILE"
-          find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
-          depmod -b /tmp/kmod ${KREL}
-
-      - name: 编译 busybox 静态二进制
-        run: |
-          wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
-          tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
-          export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
-          curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
-          cd /tmp/busybox-1.36.1
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- defconfig
-          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-          sed -i 's/^# CONFIG_BLKID is not set/CONFIG_BLKID=y/' .config
-          sed -i 's/^# CONFIG_FINDFS is not set/CONFIG_FINDFS=y/' .config
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- -j$(nproc) 2>>"$ERR_FILE"
-          mkdir -p "$GITHUB_WORKSPACE/busybox-root"
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- CONFIG_PREFIX="$GITHUB_WORKSPACE/busybox-root" install 2>>"$ERR_FILE"
-
-      - name: 打包内核并发布 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          KV="${{ env.KV }}"
-          KREL="${{ env.KREL }}"
-          cd ksrc-src
-          mkdir -p /tmp/rel/boot /tmp/rel/dtb
-          cp arch/arm64/boot/Image /tmp/rel/boot/vmlinuz-${KV}
-          cp .config /tmp/rel/boot/config-${KV}
-          cp System.map /tmp/rel/boot/System.map-${KV}
-          rm -rf /tmp/initrd 
-          mkdir -p /tmp/initrd/bin /tmp/initrd/sbin /tmp/initrd/proc /tmp/initrd/sys /tmp/initrd/dev /tmp/initrd/mnt /tmp/initrd/etc /tmp/initrd/tmp /tmp/initrd/var /tmp/initrd/run /tmp/initrd/root /tmp/initrd/lib/modules /tmp/initrd/usr/bin /tmp/initrd/usr/sbin
-          cp -a "$GITHUB_WORKSPACE/busybox-root/bin/." /tmp/initrd/bin/
-          cp -a "$GITHUB_WORKSPACE/busybox-root/sbin/." /tmp/initrd/sbin/ 2>/dev/null || true
-          chmod +x /tmp/initrd/bin/busybox
-          
-          mkdir -p /tmp/initrd/lib/modules/${KREL}
-          cp /tmp/kmod/lib/modules/${KREL}/modules.* /tmp/initrd/lib/modules/${KREL}/ 2>/dev/null || true
-          MOD_SRC="/tmp/kmod/lib/modules/${KREL}/kernel"
-          MOD_DST="/tmp/initrd/lib/modules/${KREL}/kernel"
-          mkdir -p "$MOD_DST"
-          
-          [ -d "$MOD_SRC/fs/btrfs" ] && mkdir -p "$MOD_DST/fs/btrfs" && find "$MOD_SRC/fs/btrfs" -name '*.ko' -exec cp {} "$MOD_DST/fs/btrfs/" \;
-          [ -d "$MOD_SRC/fs/ext4" ] && mkdir -p "$MOD_DST/fs/ext4" && find "$MOD_SRC/fs/ext4" -name '*.ko' -exec cp {} "$MOD_DST/fs/ext4/" \;
-          [ -d "$MOD_SRC/drivers/usb/storage" ] && mkdir -p "$MOD_DST/drivers/usb/storage" && find "$MOD_SRC/drivers/usb/storage" -name '*.ko' -exec cp {} "$MOD_DST/drivers/usb/storage/" \;
-          [ -d "$MOD_SRC/drivers/scsi" ] && mkdir -p "$MOD_DST/drivers/scsi" && find "$MOD_SRC/drivers/scsi" -name '*.ko' -exec cp {} "$MOD_DST/drivers/scsi/" \;
-          
-          cat > /tmp/initrd/init <<'INITSCRIPT'
-          #!/bin/sh
-          exec >/dev/console 2>&1
-          export PATH=/bin:/sbin
-          echo "=== N1 Custom Initramfs ==="
-          mount -t devtmpfs devtmpfs /dev
-          mount -t proc proc /proc
-          mount -t sysfs sysfs /sys
-          mkdir -p /dev/pts /dev/shm
-          mount -t devpts devpts /dev/pts
-          mount -t tmpfs tmpfs /tmp
-          mount -t tmpfs tmpfs /run
-          mkdir -p /proc/bus/usb /dev/bus/usb
-          mount -t usbfs usbfs /proc/bus/usb 2>/dev/null || true
-          mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null || true
-          echo "[init] Loading storage modules..."
-          for mod in scsi_mod sd_mod usb-storage uas btrfs ext4 fat vfat nls_utf8; do
-              modprobe $mod 2>/dev/null
-          done
-          echo "[init] Waiting for USB storage devices (max 15s)..."
-          i=0
-          while [ $i -lt 15 ]; do
-              FOUND=""
-              for d in /dev/sda1 /dev/sda2 /dev/sdb1 /dev/sdb2 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2; do
-                  [ -b "$d" ] && { FOUND=1; break; }
-              done
-              [ -n "$FOUND" ] && break
-              sleep 1
-              i=$((i+1))
-          done
-          echo "[init] Device probe finished after ${i}s"
-          ROOT_DEV=""
-          MOUNT_OPTS=""
-          find_root() {
-              if [ -x /bin/findfs ]; then
-                  ROOT_DEV=$(findfs LABEL=ROOTFS 2>/dev/null)
-                  [ -n "$ROOT_DEV" ] && return 0
-              fi
-              for dev in /dev/sda2 /dev/sda1 /dev/sdb2 /dev/sdb1 /dev/mmcblk2p2 /dev/mmcblk2p3 /dev/mmcblk1p2 /dev/mmcblk1p3; do
-                  [ -b "$dev" ] || continue
-                  mount -t btrfs -o subvol=ROOTFS,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=ROOTFS"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
-                  mount -t btrfs -o subvol=@,ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; MOUNT_OPTS="subvol=@"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
-                  mount -t btrfs -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
-                  mount -t ext4 -o ro "$dev" /mnt 2>/dev/null && { ROOT_DEV="$dev"; [ -x /mnt/sbin/init ] && return 0; umount /mnt; }
-              done
-              return 1
-          }
-          if ! find_root; then
-              sleep 5
-              if ! find_root; then
-                  echo "!!! FATAL: Cannot mount rootfs !!!"
-                  exec /bin/sh
-              fi
-          fi
-          echo "[init] Root found: $ROOT_DEV"
-          umount -l /mnt 2>/dev/null || umount /mnt 2>/dev/null || true
-          [ -n "$MOUNT_OPTS" ] && mount -t btrfs -o "$MOUNT_OPTS" "$ROOT_DEV" /mnt || mount "$ROOT_DEV" /mnt
-          if [ -x /mnt/sbin/init ]; then
-              umount /dev/pts 2>/dev/null || true
-              umount /dev 2>/dev/null || true
-              umount /sys 2>/dev/null || true
-              umount /proc 2>/dev/null || true
-              umount /tmp 2>/dev/null || true
-              umount /run 2>/dev/null || true
-              umount /proc/bus/usb 2>/dev/null || true
-              umount /dev/bus/usb 2>/dev/null || true
-              exec switch_root /mnt /sbin/init
-          fi
-          echo "!!! /mnt/sbin/init missing !!!"
-          exec /bin/sh
-          INITSCRIPT
-          chmod +x /tmp/initrd/init
-          
-          (cd /tmp/initrd && find . | cpio -o -H newc 2>/dev/null | gzip -9) > /tmp/initrd.gz
-          mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/rel/boot/uInitrd-${KV}
-          cp arch/arm64/boot/dts/amlogic/*.dtb /tmp/rel/dtb/
-          cd /tmp/rel
-          tar czf boot-${KV}.tar.gz --owner=0 --group=0 -C boot .
-          tar czf dtb-amlogic-${KV}.tar.gz --owner=0 --group=0 -C dtb .
-          tar czf modules-${KV}.tar.gz --owner=0 --group=0 -C /tmp/kmod/lib/modules $KREL
-          rm -rf /tmp/kv && mkdir -p /tmp/kv && tar xzf modules-${KV}.tar.gz -C /tmp/kv
-          test "$(ls /tmp/kv | head -1)" = "$KV" || { echo "模块目录名不一致"; exit 1; }
-          mkdir -p wrap/${KV}
-          mv boot-${KV}.tar.gz dtb-amlogic-${KV}.tar.gz modules-${KV}.tar.gz wrap/${KV}/
-          cd wrap/${KV} && sha256sum *.tar.gz > sha256sums
-          cd .. && tar czf ${KV}.tar.gz ${KV}
-          test -f "${KV}.tar.gz" || { echo "Release 资产缺失"; exit 1; }
-          
-          RELEASE_TAG="kernel-${KV}-${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" ${KV}.tar.gz --repo ${{ github.repository }} -t "kernel_stable ${KV}" -n "CI custom kernel for N1 + AX900M"
-          
-          echo ">>> 正在清理旧的 Release..."
-          gh release list --repo ${{ github.repository }} --limit 100 \
-            | grep "^kernel-[0-9]" \
-            | tail -n +6 \
-            | awk '{print $1}' \
-            | while read tag; do
-                echo "Deleting old release: $tag"
-                gh release delete "$tag" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
-              done
-              
-          rm -rf "$GITHUB_WORKSPACE/ksrc-src" /tmp/kmod /tmp/k.tar.gz "$GITHUB_WORKSPACE/busybox-root" /tmp/aarch64-linux-musl-cross
-
-      - name: 组装注入包
-        run: |
-          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
-          cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
-          cp usb_modeswitch inject/usr/sbin/
-          chmod +x inject/usr/sbin/usb_modeswitch
-          
-          cat > inject/etc/udev/rules.d/99-usb-permissions.rules <<'EOF'
-          SUBSYSTEM=="usb", MODE="0666"
-          SUBSYSTEM=="usb_device", MODE="0666"
-          EOF
-          
-          # 纯内核 sysfs 解绑脚本（放弃 usb_modeswitch）
-          cat > inject/usr/sbin/switch_card.sh <<'EOF'
-          #!/bin/sh
-          KVER=$(uname -r)
-          MOD_PATH="/lib/modules/${KVER}/kernel/drivers/aic8800"
-          
-          # 1. 强行加载固件加载器
-          insmod ${MOD_PATH}/aic_load_fw.ko 2>/dev/null
-          
-          # 2. 强行解除 usb-storage 对 1-1 设备的霸占
-          for dev in /sys/bus/usb/drivers/usb-storage/*:*; do
-              if [ -d "$dev" ]; then
-                  DEVID=$(basename "$dev")
-                  case "$DEVID" in
-                      1-1*) echo -n "$DEVID" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null ;;
-                  esac
-              fi
-          done
-          
-          sleep 1
-          
-          # 3. 强行让驱动接管 1111:1111
-          if [ -d "/sys/bus/usb/drivers/aic_load_fw" ]; then
-              echo "1111 1111" > /sys/bus/usb/drivers/aic_load_fw/new_id 2>/dev/null
-          fi
-          EOF
-          chmod +x inject/usr/sbin/switch_card.sh
-
-          cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
-          #!/bin/sh
-          [ "$ACTION" = "add" ] || exit 0
-          KVER=$(uname -r)
-          MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
-          
-          case "$PRODUCT" in
-              1111/1111/*)
-                  sleep 2
-                  /usr/sbin/switch_card.sh
-                  ;;
-              a69c/8d81/*|368b/8d81/*)
-                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
-                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
-                  modprobe btusb 2>/dev/null
-                  ;;
-          esac
-          exit 0
-          EOF
-          chmod +x inject/etc/hotplug.d/usb/99-aic8800
-          
-          # 纯 POSIX 的 rc.local
-          cat > inject/etc/rc.local <<'EOF'
-          #!/bin/sh
-          KVER=$(uname -r)
-          MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
-          i=0
-          while [ $i -lt 20 ]; do
-              if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
-                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
-                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
-                  break
-              fi
-              if grep -q "1111" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
-                  /usr/sbin/switch_card.sh
-              fi
-              sleep 3
-              i=$((i+3))
-          done
-          exit 0
-          EOF
-          chmod +x inject/etc/rc.local
-          
-          printf '#!/bin/sh\necho "==================================="\necho "  CPU Temp: $(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 )) C"\necho "==================================="\n' > inject/etc/profile.d/30-sysinfo.sh
-          chmod +x inject/etc/profile.d/30-sysinfo.sh
-          
-          cat > inject/etc/init.d/usbfs <<'EOF'
-          #!/bin/sh /etc/rc.common
-          START=10
-          start() {
-              mkdir -p /dev/bus/usb
-              mountpoint -q /dev/bus/usb || mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null
-              [ -x /sbin/udevadm ] && udevadm settle --timeout=5 2>/dev/null
-              [ -x /sbin/udevadm ] && udevadm trigger --subsystem-match=usb 2>/dev/null
-              for i in 1 2 3; do
-                  find /dev/bus/usb -type c -exec chmod 666 {} \; 2>/dev/null
-                  sleep 1
-              done
-          }
-          EOF
-          chmod +x inject/etc/init.d/usbfs
-          
-          cat > inject/etc/uci-defaults/99-zh-cn <<'EOF'
-          #!/bin/sh
-          for pkg in luci-lib-i18n luci-i18n-base-zh-cn luci-i18n-firewall-zh-cn \
-                     luci-i18n-mwan3-zh-cn luci-i18n-opkg-zh-cn luci-i18n-wifi-zh-cn; do
-              [ -f "/opt/ipks/${pkg}.ipk" ] && opkg install "/opt/ipks/${pkg}.ipk" 2>/dev/null
-          done
-          uci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null
-          rm -rf /opt/ipks
-          exit 0
-          EOF
-          chmod +x inject/etc/uci-defaults/99-zh-cn
-          
-          printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > inject/etc/uci-defaults/99-set-lan-ip
-          chmod +x inject/etc/uci-defaults/99-set-lan-ip
-          
-          # 【核心修复】直接覆盖 /etc/shadow 文件彻底解决密码为空的问题！
-          # 生成 root 密码为 'password' 的 shadow 文件
-          mkdir -p inject/etc
-          cat > inject/etc/shadow <<'EOF'
-          root:$1$password$wT.S4W5vH9OaT8mXoP.cU0:19000:0:99999:7:::
-          daemon:*:0:0:99999:7:::
-          ftp:*:0:0:99999:7:::
-          network:*:0:0:99999:7:::
-          nobody:*:0:0:99999:7:::
-          dnsmasq:x:0:0:99999:7:::
-          EOF
-          
-          cat > inject/etc/uci-defaults/00-firstboot <<'FIRSTBOOT'
-          #!/bin/sh
-          
-          /etc/init.d/usbfs enable 2>/dev/null
-          /etc/init.d/usbfs start 2>/dev/null
-          
-          i=0
-          while [ $i -lt 10 ]; do
-              if ip a show br-lan 2>/dev/null | grep -q "192.168.10.1"; then
-                  break
-              fi
-              sleep 1
-              i=$((i+1))
-          done
-          
-          /etc/init.d/dnsmasq enable 2>/dev/null
-          /etc/init.d/dnsmasq restart 2>/dev/null
-          sleep 2
-          
-          /etc/init.d/rpcd enable 2>/dev/null
-          /etc/init.d/rpcd start 2>/dev/null
-          sleep 2
-          
-          /etc/init.d/uhttpd enable 2>/dev/null
-          /etc/init.d/uhttpd start 2>/dev/null
-          
-          exit 0
-          FIRSTBOOT
-          chmod +x inject/etc/uci-defaults/00-firstboot
-
-      - name: 准备中文语言包与默认网络
-        run: |
-          mkdir -p inject/opt/ipks
-          REL="${{ github.event.inputs.openwrt_version }}"
-          REL="${REL#v}"
-          ARCH="aarch64_generic"
-          REPO="https://downloads.openwrt.org/releases/${REL}/packages/${ARCH}"
-          
-          download_ipk() {
-            local sub="$1" pkg="$2" file
-            file=$(curl -fsSL "${REPO}/${sub}/Packages.gz" | gunzip | \
-              awk -v p="${pkg}_" '
-                BEGIN { found=""; all="" }
-                $1=="Filename:" && index($2, p)==1 {
-                  if (!found) found=$2
-                  if ($2 ~ /_all\.ipk$/) { all=$2 }
-                }
-                END {
-                  if (all != "") print all
-                  else if (found != "") print found
-                  else exit 1
-                }
-              ' 2>/dev/null) || true
-            case "$file" in */*) ;; *) file="${sub}/${file}" ;; esac
-            if [ -n "$file" ]; then
-              curl -fsSL "${REPO}/${file}" -o "inject/opt/ipks/${pkg}.ipk" && echo "✅ ${pkg}" || echo "❌ ${pkg} 下载失败"
-            else
-              echo "❌ 未找到 ${pkg}"
-            fi
-          }
-          
-          download_ipk luci luci-lib-i18n
-          download_ipk luci luci-i18n-base-zh-cn
-          download_ipk luci luci-i18n-firewall-zh-cn
-          download_ipk luci luci-i18n-mwan3-zh-cn
-          download_ipk luci luci-i18n-opkg-zh-cn
-          download_ipk luci luci-i18n-wifi-zh-cn
-          
-          echo ">>> 校验语言包完整性..."
-          MISSING=""
-          for pkg in luci-lib-i18n luci-i18n-base-zh-cn; do
-              [ -f "inject/opt/ipks/${pkg}.ipk" ] || MISSING="${MISSING} ${pkg}"
-          done
-          if [ -n "$MISSING" ]; then
-            echo "❌ 关键语言包缺失:${MISSING}"
-            exit 1
-          fi
-          echo "✅ 语言包校验通过"
-
       - name: 克隆 OpenWrt 源码
         run: |
           git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+      - name: 注入 AIC8800 OpenWrt Package
+        run: |
+          cd openwrt
+          mkdir -p package/kernel/aic8800
+
+          git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
+            https://github.com/shenmintao/aic8800d80.git \
+            package/kernel/aic8800/src
+
+          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
+          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
+
+          cat > package/kernel/aic8800/Makefile <<'MAKEFILE'
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=aic8800
+PKG_VERSION:=2026.01.01
+PKG_RELEASE:=1
+
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/shenmintao/aic8800d80.git
+PKG_SOURCE_VERSION:=${{ github.event.inputs.driver_branch }}
+
+PKG_MAINTAINER:=Custom Build
+PKG_LICENSE:=GPL-2.0
+
+include $(INCLUDE_DIR)/kernel.mk
+
+define KernelPackage/aic8800
+  SUBMENU:=Wireless Drivers
+  TITLE:=AIC8800 USB WiFi driver
+  DEPENDS:=+kmod-cfg80211 +kmod-mac80211 +kmod-usb-core
+  FILES:= \
+	$(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko \
+	$(PKG_BUILD_DIR)/drivers/aic8800/aic8800_fdrv.ko
+  AUTOLOAD:=$(call AutoProbe,aic8800_fdrv aic_load_fw)
+endef
+
+define KernelPackage/aic8800/description
+  Out-of-tree AIC8800 USB WiFi driver for OpenWrt backports stack.
+endef
+
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/. $(PKG_BUILD_DIR)/
+endef
+
+define Build/Compile
+	+$(KERNEL_MAKE) $(PKG_JOBS) \
+		M="$(PKG_BUILD_DIR)/drivers/aic8800" \
+		modules
+endef
+
+$(eval $(call KernelPackage,aic8800))
+MAKEFILE
+
+          echo ">>> AIC8800 package 已注入"
 
       - name: 生成配置
         run: |
@@ -536,37 +123,39 @@ jobs:
           CONFIG_TARGET_armsr=y
           CONFIG_TARGET_armsr_armv8=y
           CONFIG_TARGET_ROOTFS_TARGZ=y
-          
+
           CONFIG_BINUTILS_VERSION_2_40=y
-          
+
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_uhttpd=y
           CONFIG_PACKAGE_uhttpd-mod-ubus=y
           CONFIG_PACKAGE_rpcd=y
           CONFIG_PACKAGE_rpcd-mod-file=y
-          
+
           CONFIG_PACKAGE_luci-lib-i18n=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-opkg-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-wifi-zh-cn=y
-          
+
           CONFIG_PACKAGE_wpad-mbedtls=y
           CONFIG_PACKAGE_iw=y
           CONFIG_PACKAGE_iwinfo=y
           CONFIG_PACKAGE_bluez-daemon=y
           CONFIG_PACKAGE_bluez-utils=y
-          
+
           CONFIG_PACKAGE_usbutils=y
           CONFIG_PACKAGE_mwan3=y
           CONFIG_PACKAGE_luci-app-mwan3=y
-          
-          CONFIG_PACKAGE_kmod-usb-core=y
-          CONFIG_PACKAGE_kmod-usb-storage=y
+
           CONFIG_PACKAGE_kmod-cfg80211=y
           CONFIG_PACKAGE_kmod-mac80211=y
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
           CONFIG_PACKAGE_libusb-1.0=y
+
+          CONFIG_PACKAGE_kmod-aic8800=y
           EOF
           make defconfig
 
@@ -609,7 +198,7 @@ jobs:
           EOF
           sudo chmod +x /usr/bin/cp
 
-      - name: 编译 OpenWrt rootfs
+      - name: 编译 OpenWrt rootfs (含 AIC8800 kmod)
         run: |
           cd openwrt
           if ! make -j$(nproc) 2>>"$ERR_FILE"; then
@@ -617,13 +206,187 @@ jobs:
             exit 1
           fi
 
-      - name: 打包 N1 固件
+      - name: 提取 OpenWrt 实际内核版本
+        id: get_kver
+        run: |
+          cd openwrt
+          KREL=$(ls staging_dir/target-*/lib/modules/ 2>/dev/null | head -1)
+          if [ -z "$KREL" ]; then
+            KREL=$(find build_dir/target-*/linux-*/linux-*/Makefile -maxdepth 0 -exec awk '/^VERSION = /{v=$3} /^PATCHLEVEL = /{p=$3} /^SUBLEVEL = /{s=$3} END{print v"."p"."s}' {} \; 2>/dev/null | head -1)
+          fi
+          if [ -z "$KREL" ]; then
+            echo "[❌] 无法提取 OpenWrt 内核版本，终止"
+            exit 1
+          fi
+          echo "KREL=${KREL}" >> $GITHUB_ENV
+          echo "OpenWrt 实际编译内核版本: ${KREL}"
+
+      - name: 校验 ophub 内核仓库是否存在该版本
+        run: |
+          KREL="${{ env.KREL }}"
+          TAG="kernel_stable"
+          FILE="${KREL}.tar.gz"
+          URL="https://github.com/ophub/kernel/releases/download/${TAG}/${FILE}"
+
+          echo ">>> 检查 ${URL}"
+          if curl -fsSL -o /dev/null -w "%{http_code}" "$URL" | grep -q "^200$"; then
+            echo "✅ ophub/kernel 存在 ${KREL}，可以精确锁定"
+          else
+            echo "[❌] ophub/kernel 的 ${TAG} 中不存在 ${KREL}.tar.gz"
+            echo "该精确内核版本在 ophub 仓库不可用，无法用 auto_kernel=false 锁定。"
+            echo "可选方案："
+            echo "  1. 改用 auto_kernel=true + 6.6.y（会滚动，可能仍不一致）"
+            echo "  2. 自行构建内核资产并推送到自己的 Release，再用 kernel_repo 指向自己的仓库"
+            exit 1
+          fi
+
+      - name: 组装注入包 (用户态工具与固件)
+        run: |
+          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
+
+          cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/ 2>/dev/null || true
+
+          wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
+          tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
+          export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
+
+          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
+          cd libusb-src
+          ./autogen.sh --host=aarch64-linux-musl --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
+          make -j$(nproc) >/dev/null && make install >/dev/null
+          cd ..
+
+          curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
+          tar xjf /tmp/ums.tar.bz2 -C /tmp
+          cd /tmp/usb-modeswitch-2.6.1
+          aarch64-linux-musl-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c \
+            -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
+          cp usb_modeswitch "$GITHUB_WORKSPACE/inject/usr/sbin/"
+          chmod +x "$GITHUB_WORKSPACE/inject/usr/sbin/usb_modeswitch"
+
+          cat > "$GITHUB_WORKSPACE/inject/etc/usb_modeswitch.d/1111:1111" <<'EOF'
+          DefaultVendor=0x1111
+          DefaultProduct=0x1111
+          TargetVendor=0xa69c
+          TargetProduct=0x8d81
+          MessageContent="555342438765432100000000000010fd0000000000000000000000000000f3"
+          MessageContent2="555342438765432100000000000010fd0000000000000000000000000000f2"
+          EOF
+
+          cat > "$GITHUB_WORKSPACE/inject/etc/udev/rules.d/99-usb-permissions.rules" <<'EOF'
+          SUBSYSTEM=="usb", MODE="0666"
+          SUBSYSTEM=="usb_device", MODE="0666"
+          EOF
+
+          cat > "$GITHUB_WORKSPACE/inject/usr/sbin/switch_card.sh" <<'EOF'
+          #!/bin/sh
+          LOCK_FILE="/tmp/.aic8800_switching"
+          if [ -f "$LOCK_FILE" ]; then exit 0; fi
+          touch "$LOCK_FILE"
+          chmod 666 /dev/bus/usb/*/* 2>/dev/null
+          /usr/sbin/usb_modeswitch -W -c /etc/usb_modeswitch.d/1111:1111 >/dev/null 2>&1
+          rm -f "$LOCK_FILE"
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/inject/usr/sbin/switch_card.sh"
+
+          cat > "$GITHUB_WORKSPACE/inject/etc/hotplug.d/usb/99-aic8800" <<'EOF'
+          #!/bin/sh
+          [ "$ACTION" = "add" ] || exit 0
+          KVER=$(uname -r)
+          MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
+
+          case "$PRODUCT" in
+              1111/1111/*)
+                  sleep 2
+                  /usr/sbin/switch_card.sh
+                  ;;
+              a69c/8d81/*|368b/8d81/*)
+                  logger -t aic8800 "WiFi Mode Detected! Loading Firmware..."
+                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
+                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
+                  modprobe btusb 2>/dev/null
+                  ;;
+          esac
+          exit 0
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/inject/etc/hotplug.d/usb/99-aic8800"
+
+          cat > "$GITHUB_WORKSPACE/inject/etc/rc.local" <<'EOF'
+          #!/bin/sh
+          KVER=$(uname -r)
+          MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
+          i=0
+          while [ $i -lt 20 ]; do
+              if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
+                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
+                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
+                  break
+              fi
+              if grep -q "1111" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
+                  /usr/sbin/switch_card.sh
+              fi
+              sleep 3
+              i=$((i+3))
+          done
+          exit 0
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/inject/etc/rc.local"
+
+          cat > "$GITHUB_WORKSPACE/inject/etc/init.d/usbfs" <<'EOF'
+          #!/bin/sh /etc/rc.common
+          START=10
+          start() {
+              mkdir -p /dev/bus/usb
+              mountpoint -q /dev/bus/usb || mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null
+              [ -x /sbin/udevadm ] && udevadm settle --timeout=5 2>/dev/null
+              [ -x /sbin/udevadm ] && udevadm trigger --subsystem-match=usb 2>/dev/null
+              for i in 1 2 3; do
+                  find /dev/bus/usb -type c -exec chmod 666 {} \; 2>/dev/null
+                  sleep 1
+              done
+          }
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/inject/etc/init.d/usbfs"
+
+          cat > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-zh-cn" <<'EOF'
+          #!/bin/sh
+          uci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null
+          exit 0
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-zh-cn"
+
+          printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
+          chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
+
+          cat > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/00-firstboot" <<'FIRSTBOOT'
+          #!/bin/sh
+          /etc/init.d/usbfs enable 2>/dev/null
+          /etc/init.d/usbfs start 2>/dev/null
+          i=0
+          while [ $i -lt 10 ]; do
+              if ip a show br-lan 2>/dev/null | grep -q "192.168.10.1"; then break; fi
+              sleep 1
+              i=$((i+1))
+          done
+          /etc/init.d/dnsmasq enable 2>/dev/null
+          /etc/init.d/dnsmasq restart 2>/dev/null
+          sleep 2
+          /etc/init.d/rpcd enable 2>/dev/null
+          /etc/init.d/rpcd start 2>/dev/null
+          sleep 2
+          /etc/init.d/uhttpd enable 2>/dev/null
+          /etc/init.d/uhttpd start 2>/dev/null
+          exit 0
+          FIRSTBOOT
+          chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/00-firstboot"
+
+      - name: 打包 N1 固件 (严格锁定内核版本)
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
           openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
           openwrt_board: s905d
-          kernel_repo: ${{ github.repository }}
-          openwrt_kernel: ${{ env.KV }}
+          kernel_repo: ophub/kernel
+          openwrt_kernel: ${{ env.KREL }}
           auto_kernel: false
           openwrt_files: inject
 
@@ -637,7 +400,7 @@ jobs:
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: N1-OpenWrt-AX900M-${{ env.KV }}-${{ github.run_number }}
+          name: N1-OpenWrt-AX900M-${{ env.KREL }}-${{ github.run_number }}
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
 
@@ -660,10 +423,10 @@ jobs:
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           ERR_FILE="$GITHUB_WORKSPACE/error_log.txt"
-          
+
           if [ "${{ job.status }}" = "success" ]; then
-            TITLE="[openwrt N1] ✅ 构建成功"
-            CONTENT="固件已编译完成，去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
+            TITLE="[openwrt N1] ✅ 构建成功 (内核: ${{ env.KREL }})"
+            CONTENT="固件已编译完成，内核版本严格锁定为 ${{ env.KREL }}。去 Actions 下载 N1-OpenWrt-AX900M 刷机即可。"
           else
             TITLE="[openwrt N1] ❌ 构建失败"
             ERR_SUMMARY=""
@@ -674,10 +437,10 @@ jobs:
               CONTENT="请到 Actions 查看失败步骤日志。"
             fi
           fi
-          
+
           FORMATTED_CONTENT=$(printf "%b" "$CONTENT")
           PAYLOAD=$(jq -n --arg title "$TITLE" --arg content "$FORMATTED_CONTENT" --arg url "$RUN_URL" '{msgtype:"text", text:{content: ($title + "\n" + $content + "\n" + $url)}}')
-          
+
           if [ -n "$DINGTALK_SECRET" ]; then
             TIMESTAMP=$(date +%s000)
             STRING_TO_SIGN="${TIMESTAMP}\n${DINGTALK_SECRET}"
