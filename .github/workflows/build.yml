@@ -168,25 +168,11 @@ jobs:
           find ../aicsrc/drivers/aic8800 -name '*.ko' -exec cp {} /tmp/kmod/lib/modules/${KREL}/kernel/drivers/aic8800/ \;
           depmod -b /tmp/kmod ${KREL}
 
-      - name: 编译绝对静态 usb_modeswitch 与 busybox
+      - name: 编译 busybox 静态二进制
         run: |
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/aarch64-linux-musl-cross.tgz
           tar xzf /tmp/aarch64-linux-musl-cross.tgz -C /tmp
           export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
-          
-          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
-          cd libusb-src
-          ./autogen.sh --host=aarch64-linux-musl --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
-          make -j$(nproc) >/dev/null && make install >/dev/null
-          cd ..
-          
-          curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
-          tar xjf /tmp/ums.tar.bz2 -C /tmp
-          cd /tmp/usb-modeswitch-2.6.1
-          aarch64-linux-musl-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c \
-            -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
-          cp usb_modeswitch "$OLDPWD/"
-          
           curl -fsSL "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" | tar xj -C /tmp
           cd /tmp/busybox-1.36.1
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-musl- defconfig
@@ -332,35 +318,44 @@ jobs:
         run: |
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
           cp -r aicsrc/fw/. inject/lib/firmware/ 2>/dev/null || true
-          cp usb_modeswitch inject/usr/sbin/
-          chmod +x inject/usr/sbin/usb_modeswitch
           
-          # 1. 纯净的 udev 规则，确保 lsusb 和 usb_modeswitch 正常
+          # 1. 写入官方配置文件（备用，虽然主要用 sg_raw 了）
+          cat > inject/etc/usb_modeswitch.d/1111:1111 <<'EOF'
+          DefaultVendor=0x1111
+          DefaultProduct=0x1111
+          TargetVendor=0xa69c
+          TargetProduct=0x8d81
+          MessageContent="555342431234567800000000000010fd0000000000000000000000000000f2"
+          EOF
+          
           cat > inject/etc/udev/rules.d/99-usb-permissions.rules <<'EOF'
           SUBSYSTEM=="usb", MODE="0666"
           SUBSYSTEM=="usb_device", MODE="0666"
           EOF
           
-          # 2. 切换脚本：硬编码双指令（F3 + F2），解决配置文件失效问题
+          # 2. 纯 POSIX 的 sg_raw 切换脚本
           cat > inject/usr/sbin/switch_card.sh <<'EOF'
           #!/bin/sh
-          LOCK_FILE="/tmp/.aic8800_switching"
-          if [ -f "$LOCK_FILE" ]; then exit 0; fi
-          touch "$LOCK_FILE"
+          LOG_TAG="aic_switch"
           
-          chmod 666 /dev/bus/usb/*/* 2>/dev/null
-          
-          # 使用明确的 F3 和 F2 序列进行切换（针对 1111:1111）
-          /usr/sbin/usb_modeswitch -v 1111 -p 1111 -W -D -R \
-            -M "555342438765432100000000000010fd0000000000000000000000000000f3" \
-            -2 "555342438765432100000000000010fd0000000000000000000000000000f2" \
-            >/tmp/switch_log 2>&1
-          
-          rm -f "$LOCK_FILE"
+          for sd in /sys/block/sd*; do
+              SIZE=$(cat $sd/size 2>/dev/null)
+              if [ "$SIZE" = "7944" ]; then
+                  DEVNAME="/dev/$(basename $sd)"
+                  logger -t "$LOG_TAG" "Found AX900M at $DEVNAME, sending SCSI commands..."
+                  if [ -x /usr/bin/sg_raw ]; then
+                      sg_raw -s 31 -b "$DEVNAME" 55 53 42 43 12 34 56 78 00 00 00 00 00 00 10 fd 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f3 >/dev/null 2>&1
+                      sleep 1
+                      sg_raw -s 31 -b "$DEVNAME" 55 53 42 43 12 34 56 78 00 00 00 00 00 00 10 fd 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f2 >/dev/null 2>&1
+                      logger -t "$LOG_TAG" "SCSI commands sent."
+                  else
+                      logger -t "$LOG_TAG" "sg_raw not found!"
+                  fi
+              fi
+          done
           EOF
           chmod +x inject/usr/sbin/switch_card.sh
 
-          # 3. 热插拔脚本：加入 3 次重试机制，解决 USB 枚举竞态
           cat > inject/etc/hotplug.d/usb/99-aic8800 <<'EOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
@@ -369,22 +364,11 @@ jobs:
           
           case "$PRODUCT" in
               1111/1111/*)
-                  # 重试机制：最多尝试3次，每次间隔2秒
-                  for i in 1 2 3; do
-                      sleep 2
-                      /usr/sbin/switch_card.sh
-                      if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
-                          logger -t aic8800 "Mode switch succeeded on attempt $i"
-                          insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
-                          insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
-                          modprobe btusb 2>/dev/null
-                          exit 0
-                      fi
-                  done
-                  logger -t aic8800 "Mode switch failed after 3 attempts"
+                  sleep 2
+                  /usr/sbin/switch_card.sh
                   ;;
               a69c/8d81/*|368b/8d81/*)
-                  logger -t aic8800 "WiFi mode detected, loading drivers..."
+                  logger -t aic8800 "WiFi Mode Detected! Loading Firmware..."
                   insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null
                   insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null
                   modprobe btusb 2>/dev/null
@@ -394,9 +378,12 @@ jobs:
           EOF
           chmod +x inject/etc/hotplug.d/usb/99-aic8800
           
-          # 4. rc.local 轮询兜底
+          # 3. 修正密码空问题并加轮询兜底
           cat > inject/etc/rc.local <<'EOF'
           #!/bin/sh
+          # 强制修复密码为空的问题
+          echo "root:password" | chpasswd
+          
           KVER=$(uname -r)
           MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
           i=0
@@ -575,6 +562,9 @@ jobs:
           CONFIG_PACKAGE_kmod-cfg80211=y
           CONFIG_PACKAGE_kmod-mac80211=y
           CONFIG_PACKAGE_libusb-1.0=y
+          
+          # 【新增】底层 SCSI 工具，用于 sg_raw 强制切换
+          CONFIG_PACKAGE_sg3-utils=y
           EOF
           make defconfig
 
