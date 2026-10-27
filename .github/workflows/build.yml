@@ -188,10 +188,16 @@ jobs:
           
           cp -a staging_dir/target-*/root-*/lib/modules/${KREL} /tmp/custom_kernel/modules/
 
+          # === 核心修复 1：生成合法的 uInitrd ===
+          echo "正在生成 uInitrd-${KREL} ..."
+          echo | cpio -o -H newc 2>/dev/null | gzip -9 > /tmp/initrd.gz
+          mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/custom_kernel/boot/uInitrd-${KREL}
+
           cd /tmp/custom_kernel
-          tar czf boot-${KREL}.tar.gz -C boot .
-          tar czf dtb-amlogic-${KREL}.tar.gz -C dtb .
-          tar czf modules-${KREL}.tar.gz -C modules ${KREL}
+          # === 核心修复 2：加上 --owner=0 --group=0 避免权限报错 ===
+          tar czf boot-${KREL}.tar.gz --owner=0 --group=0 -C boot .
+          tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
+          tar czf modules-${KREL}.tar.gz --owner=0 --group=0 -C modules ${KREL}
 
           # 按照 ophub 规范，放进版本号文件夹并打包为 <版本>.tar.gz
           mkdir -p wrap/${KREL}
@@ -199,7 +205,7 @@ jobs:
           cd wrap/${KREL}
           sha256sum *.tar.gz > sha256sums
           cd ..
-          tar czf ${KREL}.tar.gz ${KREL}
+          tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
 
           gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL}"
