@@ -180,16 +180,15 @@ jobs:
              exit 1
           fi
           
-          mkdir -p /tmp/custom_kernel/boot /tmp/custom_kernel/dtb /tmp/custom_kernel/modules/lib/modules
+          mkdir -p /tmp/custom_kernel/boot /tmp/custom_kernel/dtb /tmp/custom_kernel/modules
           
-          # 【修复 1】将 Image 重命名为 vmlinuz-${KREL}
           cp "$LINUX_DIR/arch/arm64/boot/Image" /tmp/custom_kernel/boot/vmlinuz-${KREL}
           cp "$LINUX_DIR/.config" /tmp/custom_kernel/boot/config-${KREL}
           cp "$LINUX_DIR/System.map" /tmp/custom_kernel/boot/System.map-${KREL}
           cp "$LINUX_DIR"/arch/arm64/boot/dts/amlogic/*.dtb /tmp/custom_kernel/dtb/ 2>/dev/null || true
           
-          # 【修复 2】把模块放入 lib/modules 层级
-          cp -a staging_dir/target-*/root-*/lib/modules/${KREL} /tmp/custom_kernel/modules/lib/modules/
+          # 直接复制 6.6.93 文件夹
+          cp -a staging_dir/target-*/root-*/lib/modules/${KREL} /tmp/custom_kernel/modules/
 
           echo "正在生成 uInitrd-${KREL} ..."
           echo | cpio -o -H newc 2>/dev/null | gzip -9 > /tmp/initrd.gz
@@ -198,8 +197,8 @@ jobs:
           cd /tmp/custom_kernel
           tar czf boot-${KREL}.tar.gz --owner=0 --group=0 -C boot .
           tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-          # 【修复 3】打包 modules 时带上 lib 目录
-          tar czf modules-${KREL}.tar.gz --owner=0 --group=0 -C modules lib
+          # 【核心修复】直接打包 6.6.93 文件夹
+          tar czf modules-${KREL}.tar.gz --owner=0 --group=0 -C modules ${KREL}
 
           mkdir -p wrap/${KREL}
           mv boot-${KREL}.tar.gz dtb-amlogic-${KREL}.tar.gz modules-${KREL}.tar.gz wrap/${KREL}/
@@ -318,10 +317,24 @@ jobs:
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
           chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
 
+      - name: 修复 rootfs 目录结构以兼容 ophub
+        run: |
+          cd openwrt/bin/targets/armsr/armv8/
+          mkdir -p /tmp/rootfs_fix
+          tar xzf openwrt-armsr-armv8-generic-rootfs.tar.gz -C /tmp/rootfs_fix
+          
+          mkdir -p /tmp/rootfs_fix/usr/lib
+          # 物理复制一份给 ophub 作为备用检查路径
+          cp -a /tmp/rootfs_fix/lib/modules /tmp/rootfs_fix/usr/lib/
+          
+          cd /tmp/rootfs_fix
+          tar czf /home/runner/work/n1-openwrt-ax900m/n1-openwrt-ax900m/openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz --owner=0 --group=0 *
+          cd ..
+          rm -rf /tmp/rootfs_fix
+
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
-          # 明确指定 OpenWrt 产物
           openwrt_path: openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz
           openwrt_board: s905d
           kernel_repo: ${{ github.repository }}
