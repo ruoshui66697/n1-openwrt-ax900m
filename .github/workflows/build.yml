@@ -215,6 +215,10 @@ jobs:
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
           cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/ 2>/dev/null || true
 
+          # === 核心修复：满足 ophub 的 /usr/lib/modules 强依赖 ===
+          mkdir -p inject/usr/lib/modules
+          cp -a /tmp/custom_kernel/modules/${KREL} inject/usr/lib/modules/ 2>/dev/null || true
+
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/cross.tgz
           tar xzf /tmp/cross.tgz -C /tmp
           export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
