@@ -182,7 +182,7 @@ jobs:
           
           mkdir -p /tmp/custom_kernel/boot /tmp/custom_kernel/dtb /tmp/custom_kernel/modules
           
-          # === 核心修复：将 Image 重命名为 vmlinuz-${KREL} ===
+          # 修改名字，满足 ophub 的要求
           cp "$LINUX_DIR/arch/arm64/boot/Image" /tmp/custom_kernel/boot/vmlinuz-${KREL}
           cp "$LINUX_DIR/.config" /tmp/custom_kernel/boot/config-${KREL}
           cp "$LINUX_DIR/System.map" /tmp/custom_kernel/boot/System.map-${KREL}
@@ -214,10 +214,6 @@ jobs:
         run: |
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
           cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/ 2>/dev/null || true
-
-          # === 核心修复：满足 ophub 的 /usr/lib/modules 强依赖 ===
-          mkdir -p inject/usr/lib/modules
-          cp -a /tmp/custom_kernel/modules/${KREL} inject/usr/lib/modules/ 2>/dev/null || true
 
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/cross.tgz
           tar xzf /tmp/cross.tgz -C /tmp
@@ -321,10 +317,30 @@ jobs:
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
           chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
 
+      # =======================================================
+      # 新增核心步骤：暴力篡改 rootfs，强制满足 ophub 要求
+      # =======================================================
+      - name: 修复 rootfs 目录结构以兼容 ophub
+        run: |
+          cd openwrt/bin/targets/armsr/armv8/
+          mkdir -p /tmp/rootfs_fix
+          tar xzf openwrt-armsr-armv8-generic-rootfs.tar.gz -C /tmp/rootfs_fix
+          
+          mkdir -p /tmp/rootfs_fix/usr/lib
+          # 物理复制一份，彻底杜绝软链接的潜在隐患
+          cp -a /tmp/rootfs_fix/lib/modules /tmp/rootfs_fix/usr/lib/
+          
+          cd /tmp/rootfs_fix
+          # 重新打包，覆盖原文件
+          tar czf /home/runner/work/n1-openwrt-ax900m/n1-openwrt-ax900m/openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz --owner=0 --group=0 *
+          cd ..
+          rm -rf /tmp/rootfs_fix
+
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
-          openwrt_path: openwrt/bin/targets/*/*/*rootfs.tar.gz
+          # 明确指定我们已经修改过的 rootfs 压缩包
+          openwrt_path: openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz
           openwrt_board: s905d
           kernel_repo: ${{ github.repository }}
           openwrt_kernel: ${{ env.KREL }}
