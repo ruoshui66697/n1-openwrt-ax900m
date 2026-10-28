@@ -185,10 +185,9 @@ jobs:
           cp "$LINUX_DIR/arch/arm64/boot/Image" /tmp/custom_kernel/boot/vmlinuz-${KREL}
           cp "$LINUX_DIR/.config" /tmp/custom_kernel/boot/config-${KREL}
           cp "$LINUX_DIR/System.map" /tmp/custom_kernel/boot/System.map-${KREL}
-          
           cp "$LINUX_DIR"/arch/arm64/boot/dts/amlogic/*.dtb /tmp/custom_kernel/dtb/ 2>/dev/null || true
           
-          # 直接将 6.6.93 放入 modules 根下
+          # 关键：拷贝到临时目录，保留 6.6.93 文件夹
           cp -a staging_dir/target-*/root-*/lib/modules/${KREL} /tmp/custom_kernel/modules/
 
           echo "正在生成 uInitrd-${KREL} ..."
@@ -198,7 +197,8 @@ jobs:
           cd /tmp/custom_kernel
           tar czf boot-${KREL}.tar.gz --owner=0 --group=0 -C boot .
           tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-          # 关键：打包 6.6.93 文件夹
+          
+          # 打包模块，里面直接是 6.6.93/，不带 lib 层级
           tar czf modules-${KREL}.tar.gz --owner=0 --group=0 -C modules ${KREL}
 
           mkdir -p wrap/${KREL}
@@ -214,6 +214,13 @@ jobs:
       - name: 组装注入包
         run: |
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
+          
+          # === 绝杀大招：把编译好的模块直接塞进 inject 里，解决 ophub 的核心检查 ===
+          mkdir -p inject/usr/lib/modules/${KREL}
+          mkdir -p inject/lib/modules/${KREL}
+          cp -a /tmp/custom_kernel/modules/${KREL}/. inject/usr/lib/modules/${KREL}/
+          cp -a /tmp/custom_kernel/modules/${KREL}/. inject/lib/modules/${KREL}/
+
           cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/ 2>/dev/null || true
 
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/cross.tgz
@@ -317,46 +324,6 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-zh-cn"
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
           chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
-
-      - name: 修复 rootfs 目录结构以兼容 ophub
-        run: |
-          ROOTFS_REL="openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz"
-          
-          echo "🔍 校验内核版本变量..."
-          if [ -z "${KREL}" ]; then
-            echo "❌ KREL 变量为空，无法修复 rootfs！"
-            exit 1
-          fi
-          echo "✅ 当前内核版本: ${KREL}"
-
-          echo "📦 解压原始 rootfs..."
-          rm -rf /tmp/rootfs_fix
-          mkdir -p /tmp/rootfs_fix
-          tar -xzf "${GITHUB_WORKSPACE}/${ROOTFS_REL}" -C /tmp/rootfs_fix
-
-          echo "🛠️ 注入内核模块并创建兼容目录..."
-          mkdir -p /tmp/rootfs_fix/usr/lib/modules
-          mkdir -p /tmp/rootfs_fix/lib/modules
-
-          if [ -d "/tmp/custom_kernel/modules/${KREL}" ]; then
-            cp -a "/tmp/custom_kernel/modules/${KREL}" /tmp/rootfs_fix/usr/lib/modules/
-            cp -a "/tmp/custom_kernel/modules/${KREL}" /tmp/rootfs_fix/lib/modules/
-            echo "✅ 内核模块 ${KREL} 注入成功"
-          else
-            echo "⚠️ 警告: 未找到 /tmp/custom_kernel/modules/${KREL}，仅创建空目录以通过 ophub 校验"
-          fi
-
-          echo "🔍 验证目录结构..."
-          ls -la /tmp/rootfs_fix/usr/lib/modules/ || true
-
-          echo "📦 重新打包 rootfs (使用相对路径 + .)..."
-          cd /tmp/rootfs_fix
-          # 使用 GITHUB_WORKSPACE 确保路径绝对安全，使用 . 保留隐藏文件
-          tar -czf "${GITHUB_WORKSPACE}/${ROOTFS_REL}" --owner=0 --group=0 .
-          cd -
-
-          rm -rf /tmp/rootfs_fix
-          echo "✅ rootfs 修复完成！"
 
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
