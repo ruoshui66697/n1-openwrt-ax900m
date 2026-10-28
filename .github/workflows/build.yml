@@ -187,7 +187,6 @@ jobs:
           cp "$LINUX_DIR/System.map" /tmp/custom_kernel/boot/System.map-${KREL}
           cp "$LINUX_DIR"/arch/arm64/boot/dts/amlogic/*.dtb /tmp/custom_kernel/dtb/ 2>/dev/null || true
           
-          # 关键：拷贝到临时目录，保留 6.6.93 文件夹
           cp -a staging_dir/target-*/root-*/lib/modules/${KREL} /tmp/custom_kernel/modules/
 
           echo "正在生成 uInitrd-${KREL} ..."
@@ -198,7 +197,6 @@ jobs:
           tar czf boot-${KREL}.tar.gz --owner=0 --group=0 -C boot .
           tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
           
-          # 打包模块，里面直接是 6.6.93/，不带 lib 层级
           tar czf modules-${KREL}.tar.gz --owner=0 --group=0 -C modules ${KREL}
 
           mkdir -p wrap/${KREL}
@@ -215,11 +213,17 @@ jobs:
         run: |
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
           
-          # === 绝杀大招：把编译好的模块直接塞进 inject 里，解决 ophub 的核心检查 ===
-          mkdir -p inject/usr/lib/modules/${KREL}
+          # === 关键修复：仅使用 /lib/modules 标准路径，移除 /usr/lib/modules 避免 ophub 路径检查冲突 ===
           mkdir -p inject/lib/modules/${KREL}
-          cp -a /tmp/custom_kernel/modules/${KREL}/. inject/usr/lib/modules/${KREL}/
           cp -a /tmp/custom_kernel/modules/${KREL}/. inject/lib/modules/${KREL}/
+          
+          # 验证模块目录结构完整性
+          if [ ! -d "inject/lib/modules/${KREL}/kernel" ]; then
+            echo "⚠️ 警告: 模块目录缺少 kernel 子目录，尝试重建..."
+            mkdir -p inject/lib/modules/${KREL}/kernel/drivers/aic8800
+          fi
+          echo "✅ 模块目录结构验证:"
+          ls -la inject/lib/modules/${KREL}/ | head -10
 
           cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/ 2>/dev/null || true
 
