@@ -307,7 +307,7 @@ jobs:
               for i in 1 2 3; do find /dev/bus/usb -type c -exec chmod 666 {} \; 2>/dev/null; sleep 1; done
           }
           EOF
-          chmod +x "$GITHUB_WORKSPACE/inject/etc/init.d/usbfd"
+          chmod +x "$GITHUB_WORKSPACE/inject/etc/init.d/usbfs"
 
           cat > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-zh-cn" <<'EOF'
           #!/bin/sh
