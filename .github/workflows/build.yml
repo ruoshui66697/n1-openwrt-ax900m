@@ -185,6 +185,8 @@ jobs:
           cp "$LINUX_DIR/arch/arm64/boot/Image" /tmp/custom_kernel/boot/vmlinuz-${KREL}
           cp "$LINUX_DIR/.config" /tmp/custom_kernel/boot/config-${KREL}
           cp "$LINUX_DIR/System.map" /tmp/custom_kernel/boot/System.map-${KREL}
+          
+          # armsr 目标没有 amlogic dtb，这里会是空的，后续单独补充
           cp "$LINUX_DIR"/arch/arm64/boot/dts/amlogic/*.dtb /tmp/custom_kernel/dtb/ 2>/dev/null || true
           
           cp -a staging_dir/target-*/root-*/lib/modules/${KREL} /tmp/custom_kernel/modules/
@@ -196,7 +198,6 @@ jobs:
           cd /tmp/custom_kernel
           tar czf boot-${KREL}.tar.gz --owner=0 --group=0 -C boot .
           tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-          
           tar czf modules-${KREL}.tar.gz --owner=0 --group=0 -C modules ${KREL}
 
           mkdir -p wrap/${KREL}
@@ -209,23 +210,80 @@ jobs:
           gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL}"
 
+      - name: 补充 N1 专用 DTB (关键修复)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KREL="${{ env.KREL }}"
+          if [ -z "$KREL" ]; then
+            echo "❌ KREL 为空，跳过 DTB 补充"
+            exit 1
+          fi
+          
+          echo "🔍 检查当前 kernel release 中的 DTB..."
+          mkdir -p /tmp/dtb_check
+          tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check
+          
+          if [ ! -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
+            echo "⚠️ 缺少 N1 专用 DTB，从 ophub 内核仓库拉取..."
+            # 从 ophub 官方内核仓库获取对应版本的 N1 DTB
+            OPHUB_DTB_URL="https://github.com/ophub/kernel/releases/download/dtb-amlogic/meson-gxl-s905d-phicomm-n1.dtb"
+            wget -q "$OPHUB_DTB_URL" -O /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb || {
+              echo "❌ 下载 N1 DTB 失败，尝试备用源..."
+              wget -q "https://raw.githubusercontent.com/ophub/amlogic-s9xxx-openwrt/main/build-files/amlogic-dtb/meson-gxl-s905d-phicomm-n1.dtb" -O /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb
+            }
+            
+            if [ ! -f "/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb" ]; then
+              echo "❌ 无法获取 N1 DTB，固件将无法启动！"
+              exit 1
+            fi
+            
+            # 重新打包 DTB
+            cd /tmp/custom_kernel
+            rm -f dtb-amlogic-${KREL}.tar.gz
+            tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
+            
+            # 更新 wrap 和 release
+            mv dtb-amlogic-${KREL}.tar.gz wrap/${KREL}/
+            cd wrap/${KREL}
+            sha256sum *.tar.gz > sha256sums
+            cd ..
+            rm -f ${KREL}.tar.gz
+            tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
+            
+            gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
+            gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Fixed)"
+            echo "✅ N1 DTB 补充完成"
+          else
+            echo "✅ N1 DTB 已存在，无需补充"
+          fi
+
       - name: 组装注入包
         run: |
+          KREL="${{ env.KREL }}"
           mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
           
-          # === 关键修复：仅使用 /lib/modules 标准路径，移除 /usr/lib/modules 避免 ophub 路径检查冲突 ===
+          # 仅使用标准 /lib/modules 路径
           mkdir -p inject/lib/modules/${KREL}
-          cp -a /tmp/custom_kernel/modules/${KREL}/. inject/lib/modules/${KREL}/
+          if [ -d "/tmp/custom_kernel/modules/${KREL}" ]; then
+            cp -a /tmp/custom_kernel/modules/${KREL}/. inject/lib/modules/${KREL}/
+          fi
           
-          # 验证模块目录结构完整性
+          # 验证模块目录
           if [ ! -d "inject/lib/modules/${KREL}/kernel" ]; then
-            echo "⚠️ 警告: 模块目录缺少 kernel 子目录，尝试重建..."
+            echo "⚠️ 警告: 模块目录缺少 kernel 子目录"
             mkdir -p inject/lib/modules/${KREL}/kernel/drivers/aic8800
           fi
-          echo "✅ 模块目录结构验证:"
+          echo "✅ 模块目录结构:"
           ls -la inject/lib/modules/${KREL}/ | head -10
 
-          cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/ 2>/dev/null || true
+          # 复制 AIC8800 固件
+          if [ -d "openwrt/package/kernel/aic8800/src/fw" ]; then
+            cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/
+            echo "✅ AIC8800 固件已注入"
+          else
+            echo "⚠️ 未找到 AIC8800 固件目录"
+          fi
 
           wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/cross.tgz
           tar xzf /tmp/cross.tgz -C /tmp
@@ -274,14 +332,27 @@ jobs:
           [ "$ACTION" = "add" ] || exit 0
           KVER=$(uname -r)
           MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
+          FW_DIR="/lib/firmware"
+          
+          # 检查固件是否存在，避免驱动加载崩溃
+          if [ ! -f "$FW_DIR/aic8800d80_fw.bin" ] && [ ! -f "$FW_DIR/aic8800_fw.bin" ]; then
+            logger -t aic8800 "Firmware not found, skip driver load"
+            exit 0
+          fi
+          
           case "$PRODUCT" in
-              1111/1111/*) sleep 2; /usr/sbin/switch_card.sh ;;
+              1111/1111/*) 
+                sleep 2
+                /usr/sbin/switch_card.sh 
+                ;;
               a69c/8d81/*|368b/8d81/*) 
                   modprobe cfg80211 2>/dev/null
                   modprobe mac80211 2>/dev/null
                   insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null || true
+                  sleep 1
                   insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null || true
-                  modprobe btusb 2>/dev/null ;;
+                  modprobe btusb 2>/dev/null 
+                  ;;
           esac
           exit 0
           EOF
@@ -297,6 +368,7 @@ jobs:
                   modprobe cfg80211 2>/dev/null
                   modprobe mac80211 2>/dev/null
                   insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null || true
+                  sleep 1
                   insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null || true
                   break
               fi
@@ -365,7 +437,7 @@ jobs:
           
           if [ "$JOB_STATUS" = "success" ]; then
             TITLE="[openwrt N1] ✅ 构建成功 (内核: $KERNEL_VER)"
-            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER。去 Actions 下载刷机即可。"
+            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER，N1 DTB 已注入。去 Actions 下载刷机即可。"
           else
             TITLE="[openwrt N1] ❌ 构建失败"
             ERR_SUMMARY=""
