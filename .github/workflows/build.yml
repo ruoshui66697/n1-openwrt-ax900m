@@ -220,23 +220,50 @@ jobs:
             exit 1
           fi
           
-          echo "🔍 检查当前 kernel release 中的 DTB..."
           mkdir -p /tmp/dtb_check
           tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check
           
           if [ ! -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-            echo "⚠️ 缺少 N1 专用 DTB，从 ophub 内核仓库拉取..."
-            # 从 ophub 官方内核仓库获取对应版本的 N1 DTB
-            OPHUB_DTB_URL="https://github.com/ophub/kernel/releases/download/dtb-amlogic/meson-gxl-s905d-phicomm-n1.dtb"
-            wget -q "$OPHUB_DTB_URL" -O /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb || {
-              echo "❌ 下载 N1 DTB 失败，尝试备用源..."
-              wget -q "https://raw.githubusercontent.com/ophub/amlogic-s9xxx-openwrt/main/build-files/amlogic-dtb/meson-gxl-s905d-phicomm-n1.dtb" -O /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb
-            }
+            echo "⚠️ 缺少 N1 专用 DTB，从 OpenWrt 源码编译..."
             
-            if [ ! -f "/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-              echo "❌ 无法获取 N1 DTB，固件将无法启动！"
+            # 定位内核源码目录
+            LINUX_DIR=$(find openwrt/build_dir/target-*/linux-*/linux-* -maxdepth 0 -type d | head -n 1)
+            if [ ! -d "$LINUX_DIR" ]; then
+              echo "❌ 找不到 Linux 源码目录！"
               exit 1
             fi
+            
+            # 检查 DTS 源文件是否存在
+            DTS_SRC="$LINUX_DIR/arch/arm64/boot/dts/amlogic/meson-gxl-s905d-phicomm-n1.dts"
+            if [ ! -f "$DTS_SRC" ]; then
+              echo "❌ OpenWrt 源码中不存在 N1 DTS 文件: $DTS_SRC"
+              exit 1
+            fi
+            
+            # 使用内核自带的 dtc 编译器生成 DTB
+            echo "🔨 编译 meson-gxl-s905d-phicomm-n1.dtb ..."
+            make -C "$LINUX_DIR" ARCH=arm64 CROSS_COMPILE=aarch64-openwrt-linux-musl- \
+              KBUILD_OUTPUT="$LINUX_DIR" \
+              amlogic/meson-gxl-s905d-phicomm-n1.dtb 2>>"$ERR_FILE" || {
+                # 如果交叉编译失败，尝试用系统 dtc 直接编译
+                echo "⚠️ 内核 make 编译失败，尝试使用系统 dtc..."
+                sudo apt-get install -y device-tree-compiler >/dev/null 2>&1
+                dtc -I dts -O dtb -o /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb "$DTS_SRC" 2>>"$ERR_FILE"
+              }
+            
+            # 检查是否从内核输出目录生成了 DTB
+            COMPILED_DTB="$LINUX_DIR/arch/arm64/boot/dts/amlogic/meson-gxl-s905d-phicomm-n1.dtb"
+            if [ -f "$COMPILED_DTB" ] && [ ! -f "/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb" ]; then
+              cp "$COMPILED_DTB" /tmp/custom_kernel/dtb/
+            fi
+            
+            if [ ! -f "/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb" ]; then
+              echo "❌ DTB 编译失败！"
+              cat "$ERR_FILE" | tail -20
+              exit 1
+            fi
+            
+            echo "✅ N1 DTB 编译成功 ($(stat -c%s /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb) bytes)"
             
             # 重新打包 DTB
             cd /tmp/custom_kernel
@@ -253,7 +280,6 @@ jobs:
             
             gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
             gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Fixed)"
-            echo "✅ N1 DTB 补充完成"
           else
             echo "✅ N1 DTB 已存在，无需补充"
           fi
