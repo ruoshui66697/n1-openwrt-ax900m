@@ -224,53 +224,75 @@ jobs:
           tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check
           
           if [ ! -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-            echo "⚠️ 缺少 N1 专用 DTB，从 OpenWrt 源码提取/编译..."
+            echo "⚠️ 缺少 N1 专用 DTB，从 ophub 官方固件提取..."
             
-            LINUX_DIR=$(find openwrt/build_dir/target-*/linux-*/linux-* -maxdepth 0 -type d | head -n 1)
-            if [ ! -d "$LINUX_DIR" ]; then
-              echo "❌ 找不到 Linux 源码目录！"
+            # 从 ophub 最新 s905d 固件中提取 N1 DTB（最可靠来源）
+            OPHUB_RELEASE_URL="https://api.github.com/repos/ophub/amlogic-s9xxx-openwrt/releases/latest"
+            FIRMWARE_URL=$(curl -sS "$OPHUB_RELEASE_URL" | jq -r '.assets[] | select(.name | test("OpenWrt_s905d.*\\.img\\.gz")) | .browser_download_url' | head -n 1)
+            
+            if [ -z "$FIRMWARE_URL" ] || [ "$FIRMWARE_URL" = "null" ]; then
+              echo "❌ 无法获取 ophub s905d 固件下载地址"
               exit 1
             fi
             
-            DTS_SRC="$LINUX_DIR/arch/arm64/boot/dts/amlogic/meson-gxl-s905d-phicomm-n1.dts"
-            if [ ! -f "$DTS_SRC" ]; then
-              echo "❌ OpenWrt 源码中不存在 N1 DTS 文件: $DTS_SRC"
+            echo "📥 下载 ophub s905d 固件: $FIRMWARE_URL"
+            wget -q --timeout=60 --tries=3 "$FIRMWARE_URL" -O /tmp/ophub_s905d.img.gz || {
+              echo "❌ 固件下载失败"
+              exit 1
+            }
+            
+            echo "🔧 解压并提取 DTB..."
+            gunzip -f /tmp/ophub_s905d.img.gz
+            # OpenWrt 固件镜像中 DTB 通常位于偏移 0x800000 附近，但更可靠的方式是搜索文件头
+            # 使用 binwalk 或直接挂载 ext4 分区提取
+            sudo apt-get install -y -qq binwalk >/dev/null 2>&1 || true
+            
+            # 尝试从镜像中提取 dtb 文件
+            mkdir -p /tmp/ophub_extract
+            cd /tmp/ophub_extract
+            
+            # 方法1: 直接用 strings + grep 定位 DTB 魔数并提取（最快）
+            # DTB 魔数: d00dfeed (big-endian)
+            python3 << 'PYEOF'
+          import struct, sys, os
+          
+          with open('/tmp/ophub_s905d.img', 'rb') as f:
+              data = f.read()
+          
+          magic = b'\xd0\x0d\xfe\xed'
+          pos = 0
+          dtbs = []
+          while True:
+              idx = data.find(magic, pos)
+              if idx == -1:
+                  break
+              # 读取 DTB total size (offset 4, big-endian uint32)
+              if idx + 8 <= len(data):
+                  size = struct.unpack('>I', data[idx+4:idx+8])[0]
+                  if 1000 < size < 500000:  # 合理 DTB 大小范围
+                      dtbs.append((idx, size))
+              pos = idx + 4
+          
+          # 查找包含 "phicomm-n1" 字符串的 DTB
+          for offset, size in dtbs:
+              chunk = data[offset:offset+size]
+              if b'phicomm-n1' in chunk or b'phicomm' in chunk:
+                  outpath = '/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb'
+                  with open(outpath, 'wb') as out:
+                      out.write(chunk)
+                  print(f"✅ Found N1 DTB at offset {offset}, size {size}")
+                  sys.exit(0)
+          
+          print("❌ No N1 DTB found in firmware image")
+          sys.exit(1)
+          PYEOF
+            
+            if [ ! -f "/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb" ]; then
+              echo "❌ 从固件中提取 N1 DTB 失败"
               exit 1
             fi
             
-            # 优先使用内核源码自带的 dtc 编译器（无需安装系统包）
-            KERNEL_DTC="$LINUX_DIR/scripts/dtc/dtc"
-            OUTPUT_DTB="/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb"
-            
-            if [ -x "$KERNEL_DTC" ]; then
-              echo "🔨 使用内核自带 dtc 编译..."
-              "$KERNEL_DTC" -I dts -O dtb -o "$OUTPUT_DTB" "$DTS_SRC" 2>>"$ERR_FILE" || true
-            fi
-            
-            # 如果内核 dtc 失败，尝试查找已编译好的 DTB（armsr 可能已生成但未拷贝）
-            if [ ! -f "$OUTPUT_DTB" ]; then
-              echo "🔍 搜索已编译的 DTB 文件..."
-              FOUND_DTB=$(find "$LINUX_DIR" -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
-              if [ -n "$FOUND_DTB" ]; then
-                cp "$FOUND_DTB" "$OUTPUT_DTB"
-                echo "✅ 找到已编译 DTB: $FOUND_DTB"
-              fi
-            fi
-            
-            # 最后兜底：安装系统 dtc 编译
-            if [ ! -f "$OUTPUT_DTB" ]; then
-              echo "⚠️ 前述方法均失败，安装系统 dtc 编译..."
-              sudo apt-get update -qq && sudo apt-get install -y -qq device-tree-compiler >/dev/null 2>&1
-              dtc -I dts -O dtb -o "$OUTPUT_DTB" "$DTS_SRC" 2>>"$ERR_FILE"
-            fi
-            
-            if [ ! -f "$OUTPUT_DTB" ] || [ ! -s "$OUTPUT_DTB" ]; then
-              echo "❌ DTB 编译/提取彻底失败！"
-              cat "$ERR_FILE" | tail -30
-              exit 1
-            fi
-            
-            echo "✅ N1 DTB 准备成功 ($(stat -c%s "$OUTPUT_DTB") bytes)"
+            echo "✅ N1 DTB 提取成功 ($(stat -c%s /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb) bytes)"
             
             # 重新打包 DTB
             cd /tmp/custom_kernel
