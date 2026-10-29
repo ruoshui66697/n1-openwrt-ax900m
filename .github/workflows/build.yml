@@ -224,74 +224,42 @@ jobs:
           tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check
           
           if [ ! -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-            echo "⚠️ 缺少 N1 专用 DTB，从 ophub 官方固件提取..."
+            echo "⚠️ 缺少 N1 专用 DTB，从 ophub DTB 专用包提取..."
             
-            # 从 ophub 最新 s905d 固件中提取 N1 DTB（最可靠来源）
-            OPHUB_RELEASE_URL="https://api.github.com/repos/ophub/amlogic-s9xxx-openwrt/releases/latest"
-            FIRMWARE_URL=$(curl -sS "$OPHUB_RELEASE_URL" | jq -r '.assets[] | select(.name | test("OpenWrt_s905d.*\\.img\\.gz")) | .browser_download_url' | head -n 1)
+            # 使用 amlogic-s9xxx-armbian 仓库的 DTB 包（比 OpenWrt 固件更稳定）
+            DTB_RELEASE_URL="https://api.github.com/repos/ophub/amlogic-s9xxx-armbian/releases/latest"
+            DTB_PKG_URL=$(curl -sS "$DTB_RELEASE_URL" | jq -r '.assets[] | select(.name | test("dtb-amlogic.*\\.tar\\.gz")) | .browser_download_url' | head -n 1)
             
-            if [ -z "$FIRMWARE_URL" ] || [ "$FIRMWARE_URL" = "null" ]; then
-              echo "❌ 无法获取 ophub s905d 固件下载地址"
+            if [ -z "$DTB_PKG_URL" ] || [ "$DTB_PKG_URL" = "null" ]; then
+              echo "⚠️ armbian DTB 包获取失败，尝试从 flippy 内核仓库获取..."
+              FLIPPY_URL="https://api.github.com/repos/unifreq/openwrt_packit/releases/latest"
+              DTB_PKG_URL=$(curl -sS "$FLIPPY_URL" | jq -r '.assets[] | select(.name | test("dtb-amlogic.*\\.tar\\.gz")) | .browser_download_url' | head -n 1)
+            fi
+            
+            if [ -z "$DTB_PKG_URL" ] || [ "$DTB_PKG_URL" = "null" ]; then
+              echo "❌ 所有 DTB 源均获取失败"
               exit 1
             fi
             
-            echo "📥 下载 ophub s905d 固件: $FIRMWARE_URL"
-            wget -q --timeout=60 --tries=3 "$FIRMWARE_URL" -O /tmp/ophub_s905d.img.gz || {
-              echo "❌ 固件下载失败"
+            echo "📥 下载 DTB 包: $DTB_PKG_URL"
+            wget -q --timeout=60 --tries=3 "$DTB_PKG_URL" -O /tmp/dtb-amlogic.tar.gz || {
+              echo "❌ DTB 包下载失败"
               exit 1
             }
             
-            echo "🔧 解压并提取 DTB..."
-            gunzip -f /tmp/ophub_s905d.img.gz
-            # OpenWrt 固件镜像中 DTB 通常位于偏移 0x800000 附近，但更可靠的方式是搜索文件头
-            # 使用 binwalk 或直接挂载 ext4 分区提取
-            sudo apt-get install -y -qq binwalk >/dev/null 2>&1 || true
+            echo "🔧 解压并查找 N1 DTB..."
+            mkdir -p /tmp/dtb_extract
+            tar xzf /tmp/dtb-amlogic.tar.gz -C /tmp/dtb_extract
             
-            # 尝试从镜像中提取 dtb 文件
-            mkdir -p /tmp/ophub_extract
-            cd /tmp/ophub_extract
-            
-            # 方法1: 直接用 strings + grep 定位 DTB 魔数并提取（最快）
-            # DTB 魔数: d00dfeed (big-endian)
-            python3 << 'PYEOF'
-          import struct, sys, os
-          
-          with open('/tmp/ophub_s905d.img', 'rb') as f:
-              data = f.read()
-          
-          magic = b'\xd0\x0d\xfe\xed'
-          pos = 0
-          dtbs = []
-          while True:
-              idx = data.find(magic, pos)
-              if idx == -1:
-                  break
-              # 读取 DTB total size (offset 4, big-endian uint32)
-              if idx + 8 <= len(data):
-                  size = struct.unpack('>I', data[idx+4:idx+8])[0]
-                  if 1000 < size < 500000:  # 合理 DTB 大小范围
-                      dtbs.append((idx, size))
-              pos = idx + 4
-          
-          # 查找包含 "phicomm-n1" 字符串的 DTB
-          for offset, size in dtbs:
-              chunk = data[offset:offset+size]
-              if b'phicomm-n1' in chunk or b'phicomm' in chunk:
-                  outpath = '/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb'
-                  with open(outpath, 'wb') as out:
-                      out.write(chunk)
-                  print(f"✅ Found N1 DTB at offset {offset}, size {size}")
-                  sys.exit(0)
-          
-          print("❌ No N1 DTB found in firmware image")
-          sys.exit(1)
-          PYEOF
-            
-            if [ ! -f "/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-              echo "❌ 从固件中提取 N1 DTB 失败"
+            FOUND_DTB=$(find /tmp/dtb_extract -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
+            if [ -z "$FOUND_DTB" ]; then
+              echo "❌ DTB 包中未找到 meson-gxl-s905d-phicomm-n1.dtb"
+              echo "📋 包内可用 DTB 列表:"
+              find /tmp/dtb_extract -name "*.dtb" -type f | sort
               exit 1
             fi
             
+            cp "$FOUND_DTB" /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb
             echo "✅ N1 DTB 提取成功 ($(stat -c%s /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb) bytes)"
             
             # 重新打包 DTB
