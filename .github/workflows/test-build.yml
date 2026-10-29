@@ -211,79 +211,63 @@ jobs:
           gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL}"
 
-      - name: 补充 N1 专用 DTB (从内核源码编译)
+      # === ⬇️ 核心修改：替换原有的源码编译，改为安全拉取并校验 ⬇️ ===
+      - name: 注入 N1 专用 DTB (安全拉取并校验)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
           KREL="${{ env.KREL }}"
           if [ -z "$KREL" ]; then
-            echo "❌ KREL 为空，跳过 DTB 补充"
+            echo "❌ KREL 为空，跳过 DTB 注入"
             exit 1
           fi
           
-          mkdir -p /tmp/dtb_check
-          tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check
+          echo "🚀 开始获取并注入 N1 专用 DTB..."
+          DTB_TARGET_DIR="/tmp/custom_kernel/dtb"
+          mkdir -p "${DTB_TARGET_DIR}"
           
-          if [ ! -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-            echo "⚠️ 缺少 N1 专用 DTB，从内核源码编译..."
+          N1_DTB_URL="https://raw.githubusercontent.com/ophub/amlogic-s9xxx-openwrt/main/build/openwrt-files/platforms/amlogic/dtb/amlogic/meson-gxl-s905d-phicomm-n1.dtb"
+          
+          echo "🌐 正在下载: meson-gxl-s905d-phicomm-n1.dtb"
+          # --retry 3: 失败自动重试3次
+          # --connect-timeout 15: 连接超时15秒，防止 Actions 卡死
+          # -f: 遇到 HTTP 错误(如404)直接返回非零状态码，不下载HTML
+          curl -fSL --retry 3 --connect-timeout 15 \
+            -o "${DTB_TARGET_DIR}/meson-gxl-s905d-phicomm-n1.dtb" \
+            "${N1_DTB_URL}"
             
-            LINUX_DIR=$(find openwrt/build_dir/target-*/linux-*/linux-* -maxdepth 0 -type d | head -n 1)
-            if [ ! -d "$LINUX_DIR" ]; then
-              echo "❌ 找不到 Linux 编译目录"
-              exit 1
-            fi
-            
-            DTS_FILE="$LINUX_DIR/arch/arm64/boot/dts/amlogic/meson-gxl-s905d-phicomm-n1.dts"
-            if [ ! -f "$DTS_FILE" ]; then
-              echo "❌ DTS 源文件不存在: $DTS_FILE"
-              echo "📋 可用的 amlogic DTS 文件:"
-              ls "$LINUX_DIR/arch/arm64/boot/dts/amlogic/"*phicomm* 2>/dev/null || \
-              ls "$LINUX_DIR/arch/arm64/boot/dts/amlogic/"*s905d* 2>/dev/null || \
-              echo "(无匹配文件)"
-              exit 1
-            fi
-            
-            echo "📄 找到 DTS: $DTS_FILE"
-            
-            # 优先使用内核自带的 dtc（与内核版本严格匹配）
-            DTC="$LINUX_DIR/scripts/dtc/dtc"
-            if [ ! -x "$DTC" ]; then
-              echo "🔨 编译内核自带 dtc..."
-              make -C "$LINUX_DIR" scripts/dtc HOSTCC=gcc 2>&1 | tail -5
-            fi
-            
-            if [ ! -x "$DTC" ]; then
-              echo "⚠️ 内核 dtc 不可用，回退到系统 dtc..."
-              DTC="dtc"
-            fi
-            
-            mkdir -p /tmp/custom_kernel/dtb
-            "$DTC" -I dts -O dtb -o /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb "$DTS_FILE" 2>&1
-            
-            if [ ! -s "/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-              echo "❌ DTB 编译失败或输出为空"
-              exit 1
-            fi
-            
-            echo "✅ N1 DTB 编译成功 ($(stat -c%s /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb) bytes)"
-            
-            # 重新打包 DTB 和内核包
-            cd /tmp/custom_kernel
-            rm -f dtb-amlogic-${KREL}.tar.gz
-            tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-            
-            mv dtb-amlogic-${KREL}.tar.gz wrap/${KREL}/
-            cd wrap/${KREL}
-            sha256sum *.tar.gz > sha256sums
-            cd ..
-            rm -f ${KREL}.tar.gz
-            tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
-            
-            gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
-            gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Fixed)"
-          else
-            echo "✅ N1 DTB 已存在，无需补充"
+          # 严格校验文件是否真实下载成功
+          DOWNLOADED_FILE="${DTB_TARGET_DIR}/meson-gxl-s905d-phicomm-n1.dtb"
+          if [ ! -f "$DOWNLOADED_FILE" ] || [ ! -s "$DOWNLOADED_FILE" ]; then
+            echo "❌ FATAL: DTB 下载失败或文件为空！"
+            exit 1
           fi
+          
+          # 检查文件头是否为真实的 DTB 二进制文件 (魔数检查)
+          if ! file "$DOWNLOADED_FILE" | grep -q "Device Tree Blob"; then
+            echo "❌ FATAL: 下载的文件不是有效的 DTB 格式！可能返回了错误页面。"
+            cat "$DOWNLOADED_FILE"
+            exit 1
+          fi
+          
+          echo "✅ N1 DTB 注入成功且校验通过！文件大小: $(du -h "$DOWNLOADED_FILE" | cut -f1)"
+          
+          # 重新打包 DTB 和内核包以包含新注入的 DTB
+          cd /tmp/custom_kernel
+          rm -f dtb-amlogic-${KREL}.tar.gz
+          tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
+          
+          mv dtb-amlogic-${KREL}.tar.gz wrap/${KREL}/
+          cd wrap/${KREL}
+          sha256sum *.tar.gz > sha256sums
+          cd ..
+          rm -f ${KREL}.tar.gz
+          tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
+          
+          gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
+          gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Injected)"
+      # === ⬆️ 核心修改结束 ⬆️ ===
 
       - name: 组装注入包
         run: |
@@ -464,7 +448,7 @@ jobs:
           
           if [ "$JOB_STATUS" = "success" ]; then
             TITLE="[openwrt N1] ✅ 构建成功 (内核: $KERNEL_VER)"
-            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER，N1 DTB 已从源码编译注入。去 Actions 下载刷机即可。"
+            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER，N1 DTB 已安全注入。去 Actions 下载刷机即可。"
           else
             TITLE="[openwrt N1] ❌ 构建失败"
             ERR_SUMMARY=""
