@@ -213,161 +213,74 @@ jobs:
           gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL}"
 
       - name: 补充 N1 专用 DTB (多源 fallback)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          
           KREL="${{ env.KREL }}"
           if [ -z "$KREL" ]; then
             echo "❌ KREL 为空，跳过 DTB 补充"
             exit 1
           fi
-
-          echo "🚀 开始获取 N1 专用 DTB..."
-
+          
           # 检查当前内核包中是否已有 N1 DTB
           mkdir -p /tmp/dtb_check
           tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check 2>/dev/null || true
-
+          
           if [ -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
             echo "✅ N1 DTB 已存在，无需补充"
           else
             echo "⚠️ 缺少 N1 专用 DTB，开始多源获取..."
-
-            DTB_TARGET="/tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb"
-            mkdir -p "$(dirname "$DTB_TARGET")"
-            DTB_DOWNLOADED=false
-
-            # === 源1: 克隆 ophub 仓库用 find 搜索(不硬编码路径) ===
-            echo "📦 源1: 尝试从 ophub 仓库克隆搜索..."
-            cd "$GITHUB_WORKSPACE"
-            git clone --depth 1 https://github.com/ophub/amlogic-s9xxx-openwrt.git ophub-repo 2>&1 | tail -3
-            N1_DTB_FOUND=$(find ophub-repo -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
-            if [ -n "$N1_DTB_FOUND" ]; then
-              echo "✅ 源1成功: $N1_DTB_FOUND"
-              cp "$N1_DTB_FOUND" "$DTB_TARGET"
-              DTB_DOWNLOADED=true
-            fi
-            rm -rf "$GITHUB_WORKSPACE/ophub-repo"
-
-            # === 源2: 从 Armbian build 仓库下载 dtb 包 ===
-            if [ "$DTB_DOWNLOADED" != "true" ]; then
-              echo "📦 源2: 尝试从 Armbian build 仓库下载..."
-              ARMBIAN_DTB_URLS=(
-                "https://github.com/armbian/build/raw/main/cache/dtb/branch-main/s905d/dtb/meson-gxl-s905d-phicomm-n1.dtb"
-                "https://github.com/armbian/build/raw/main/cache/dtb/main/s905d/dtb/meson-gxl-s905d-phicomm-n1.dtb"
-              )
-              for url in "${ARMBIAN_DTB_URLS[@]}"; do
-                echo "  尝试: $url"
-                if curl -fSL --retry 2 --connect-timeout 15 -o "$DTB_TARGET" "$url" 2>/dev/null; then
-                  if [ -s "$DTB_TARGET" ] && file "$DTB_TARGET" | grep -q "Device Tree"; then
-                    echo "✅ 源2成功: $url"
-                    DTB_DOWNLOADED=true
-                    break
-                  else
-                    echo "  ⚠️ 文件无效，重试下一个..."
-                    rm -f "$DTB_TARGET"
-                  fi
-                else
-                  echo "  ⚠️ 下载失败"
-                fi
-              done
-            fi
-
-            # === 源3: 从 unifreq/openwrt_packit 仓库搜索 ===
-            if [ "$DTB_DOWNLOADED" != "true" ]; then
-              echo "📦 源3: 尝试从 unifreq/openwrt_packit 仓库搜索..."
-              cd "$GITHUB_WORKSPACE"
-              git clone --depth 1 https://github.com/unifreq/openwrt_packit.git unifreq-repo 2>&1 | tail -3
-              N1_DTB_FOUND=$(find unifreq-repo -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
-              if [ -n "$N1_DTB_FOUND" ]; then
-                echo "✅ 源3成功: $N1_DTB_FOUND"
-                cp "$N1_DTB_FOUND" "$DTB_TARGET"
-                DTB_DOWNLOADED=true
-              fi
-              # 也搜索 .dts 文件看能否本地编译
-              if [ "$DTB_DOWNLOADED" != "true" ]; then
-                DTS_FOUND=$(find unifreq-repo -name "meson-gxl-s905d-phicomm-n1.dts" -type f 2>/dev/null | head -n 1)
-                if [ -n "$DTS_FOUND" ]; then
-                  echo "⚠️ 找到 DTS 但无编译 DTB，尝试用系统 dtc 编译..."
-                  if command -v dtc &>/dev/null; then
-                    dtc -I dts -O dtb -o "$DTB_TARGET" "$DTS_FOUND" 2>&1
-                    if [ -s "$DTB_TARGET" ]; then
-                      echo "✅ 源3编译成功"
-                      DTB_DOWNLOADED=true
-                    else
-                      echo "  ⚠️ dtc 编译失败"
-                      rm -f "$DTB_TARGET"
-                    fi
-                  fi
-                fi
-              fi
-              rm -rf "$GITHUB_WORKSPACE/unifreq-repo"
-            fi
-
-            # === 源4: 从 Armbian releases 下载包含 dtb 的固件包 ===
-            if [ "$DTB_DOWNLOADED" != "true" ]; then
-              echo "📦 源4: 尝试从 Armbian releases 下载..."
-              # 下载 Armbian N1 固件的 BOOT 分区中的 dtb
-              curl -fSL --retry 2 --connect-timeout 15                 "https://github.com/armbian/build/raw/main/cache/rootfs/branch-main/s905d/s905d.armbian"                 -o /tmp/test_url 2>/dev/null
-              if [ $? -eq 0 ] && [ -s /tmp/test_url ]; then
-                echo "  ⚠️ Armbian raw 路径不可用，尝试 releases API..."
-                # 尝试通过 GitHub API 获取最新的 armbian 构建产物
-                ARMPIAN_API="https://api.github.com/repos/armbian/build/releases/latest"
-                RELEASE_URL=$(curl -sL --retry 2 "$ARMPIAN_API" 2>/dev/null | grep "browser_download_url" | grep "s905d" | grep -o "https://[^ "']*" | head -n 1)
-                if [ -n "$RELEASE_URL" ]; then
-                  echo "  找到 release URL: $RELEASE_URL"
-                  # 下载并尝试解压获取 dtb
-                  curl -fSL --retry 2 --connect-timeout 30 -o /tmp/armbian-dtb.tar.gz "$RELEASE_URL" 2>/dev/null
-                  if [ -s /tmp/armbian-dtb.tar.gz ]; then
-                    mkdir -p /tmp/armbian-dtb-extract
-                    tar xzf /tmp/armbian-dtb.tar.gz -C /tmp/armbian-dtb-extract 2>/dev/null
-                    FOUND=$(find /tmp/armbian-dtb-extract -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
-                    if [ -n "$FOUND" ]; then
-                      cp "$FOUND" "$DTB_TARGET"
-                      DTB_DOWNLOADED=true
-                      echo "✅ 源4成功"
-                    fi
-                    rm -rf /tmp/armbian-dtb-extract
-                  fi
-                fi
-              fi
-              rm -f /tmp/test_url /tmp/armbian-dtb.tar.gz
-            fi
-
-            # === 最终检查 ===
-            if [ "$DTB_DOWNLOADED" != "true" ]; then
-              echo "❌ 所有源均失败，输出诊断信息..."
-              echo "--- 当前目录文件 ---"
-              ls -la /tmp/custom_kernel/dtb/ 2>/dev/null || echo "(目录为空)"
-              echo "--- 系统 dtc 可用性 ---"
-              which dtc 2>/dev/null || echo "dtc 未安装"
-              echo "--- 请检查网络连接或手动提供 DTB 文件 ---"
+            
+            # 运行仓库根目录的 DTB 获取脚本
+            if [ -f "fix-n1-dtdb.sh" ]; then
+              chmod +x fix-n1-dtdb.sh
+              bash fix-n1-dtdb.sh
+            else
+              echo "❌ 未找到 fix-n1-dtdb.sh 脚本！请确保该脚本已提交到仓库根目录"
               exit 1
             fi
           fi
-
-          # 验证 DTB 文件
-          if [ ! -s "$DTB_TARGET" ]; then
-            echo "❌ DTB 文件为空或不存在"
-            exit 1
+          
+          # 将下载的 DTB 复制到内核输出目录
+          DTB_SOURCE=$(find openwrt/bin/targets -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
+          if [ -n "$DTB_SOURCE" ]; then
+            mkdir -p /tmp/custom_kernel/dtb
+            cp "$DTB_SOURCE" /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb
+            echo "✅ DTB 已复制到内核输出目录"
+          else
+            echo "⚠️ 未找到下载的 DTB 文件，尝试默认路径..."
+            if [ -f "openwrt/bin/targets/armsr/armv8/dtb/amlogic/meson-gxl-s905d-phicomm-n1.dtb" ]; then
+              mkdir -p /tmp/custom_kernel/dtb
+              cp "openwrt/bin/targets/armsr/armv8/dtb/amlogic/meson-gxl-s905d-phicomm-n1.dtb" /tmp/custom_kernel/dtb/
+              echo "✅ DTB 已从默认路径复制"
+            else
+              echo "❌ 无法定位 DTB 文件，所有源可能均已失败"
+              ls -la openwrt/bin/targets/armsr/armv8/dtb/amlogic/ 2>/dev/null || echo "(目录不存在)"
+              exit 1
+            fi
+          fi
+          
+          # 重新打包 DTB 和内核包
+          if [ -d "/tmp/custom_kernel/dtb" ] && [ "$(ls -A /tmp/custom_kernel/dtb/ 2>/dev/null)" ]; then
+            cd /tmp/custom_kernel
+            rm -f dtb-amlogic-${KREL}.tar.gz
+            tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
+            
+            mv dtb-amlogic-${KREL}.tar.gz wrap/${KREL}/
+            cd wrap/${KREL}
+            sha256sum *.tar.gz > sha256sums
+            cd ..
+            rm -f ${KREL}.tar.gz
+            tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
+            
+            gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
+            gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Injected)"
+            echo "✅ 内核 Release 已更新，包含 N1 DTB"
+          else
+            echo "⚠️ /tmp/custom_kernel/dtb/ 为空，跳过重新打包"
           fi
 
-          echo "✅ N1 DTB 注入成功 ($(stat -c%s "$DTB_TARGET") bytes)"
-
-          # 重新打包 DTB 和内核包
-          cd /tmp/custom_kernel
-          rm -f dtb-amlogic-${KREL}.tar.gz
-          tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-
-          mv dtb-amlogic-${KREL}.tar.gz wrap/${KREL}/
-          cd wrap/${KREL}
-          sha256sum *.tar.gz > sha256sums
-          cd ..
-          rm -f ${KREL}.tar.gz
-          tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
-
-          gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
-          gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Injected)"
       - name: 组装注入包
         run: |
           KREL="${{ env.KREL }}"
@@ -547,7 +460,7 @@ jobs:
           
           if [ "$JOB_STATUS" = "success" ]; then
             TITLE="[openwrt N1] ✅ 构建成功 (内核: $KERNEL_VER)"
-            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER，N1 DTB 已从 ophub 仓库注入。去 Actions 下载刷机即可。"
+            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER，N1 DTB 已从源码编译注入。去 Actions 下载刷机即可。"
           else
             TITLE="[openwrt N1] ❌ 构建失败"
             ERR_SUMMARY=""
