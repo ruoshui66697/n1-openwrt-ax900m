@@ -212,75 +212,119 @@ jobs:
           gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
           gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL}"
 
-      - name: 补充 N1 专用 DTB (多源 fallback)
+      - name: 补充 N1 专用 DTB (多源获取)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
           
           KREL="${{ env.KREL }}"
           if [ -z "$KREL" ]; then
-            echo "❌ KREL 为空，跳过 DTB 补充"
-            exit 1
+             echo "❌ KREL 为空，跳过 DTB 补充"
+             exit 1
           fi
-          
+
+          echo "🚀 开始获取并注入 N1 专用 DTB..."
+
           # 检查当前内核包中是否已有 N1 DTB
           mkdir -p /tmp/dtb_check
           tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check 2>/dev/null || true
-          
+
           if [ -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
             echo "✅ N1 DTB 已存在，无需补充"
+            exit 0
           else
             echo "⚠️ 缺少 N1 专用 DTB，开始多源获取..."
             
-            # 运行仓库根目录的 DTB 获取脚本（已修正文件名）
-            if [ -f "$GITHUB_WORKSPACE/fix-n1-dtb.sh" ]; then
-              chmod +x "$GITHUB_WORKSPACE/fix-n1-dtb.sh"
-              bash "$GITHUB_WORKSPACE/fix-n1-dtb.sh"
-            else
-              echo "❌ 未找到 fix-n1-dtb.sh 脚本！请确保该脚本已提交到仓库根目录"
-              echo "📂 当前根目录文件："
-              ls -la "$GITHUB_WORKSPACE"
+            # 动态查找 dtb 输出目录
+            DTB_TARGET_DIR=$(find openwrt/bin/targets -type d -name "amlogic" -path "*/dtb/*" 2>/dev/null | head -n 1)
+            if [ -z "${DTB_TARGET_DIR:-}" ]; then
+                echo "⚠️ 未找到现有 dtb/amlogic 目录，创建默认路径..."
+                DTB_TARGET_DIR="openwrt/bin/targets/armsr/armv8/dtb/amlogic"
+            fi
+            mkdir -p "$DTB_TARGET_DIR"
+            echo "📁 DTB 目标路径: $DTB_TARGET_DIR"
+
+            TARGET_FILE="$DTB_TARGET_DIR/meson-gxl-s905d-phicomm-n1.dtb"
+            FOUND=0
+
+            # === 源1: clone ophub 仓库并搜索 ===
+            if [ "$FOUND" -eq 0 ]; then
+                echo "🔍 [源1] 从 ophub/amlogic-s9xxx-openwrt 仓库搜索..."
+                TMPDIR=$(mktemp -d)
+                if git clone --depth 1 --filter=blob:none --sparse https://github.com/ophub/amlogic-s9xxx-openwrt.git "$TMPDIR/repo" 2>/dev/null; then
+                    cd "$TMPDIR/repo"
+                    git sparse-checkout set build 2>/dev/null || true
+                    SRC=$(find . -type f -name "meson-gxl-s905d-phicomm-n1.dtb" | head -n 1)
+                    if [ -n "${SRC:-}" ]; then
+                        cp "$SRC" "$TARGET_FILE"
+                        FOUND=1
+                        echo "✅ [源1] 成功找到并复制 DTB"
+                    fi
+                    cd - > /dev/null
+                fi
+                rm -rf "$TMPDIR"
+            fi
+
+            # === 源2: clone unifreq/openwrt_packit 搜索 ===
+            if [ "$FOUND" -eq 0 ]; then
+                echo "🔍 [源2] 从 unifreq/openwrt_packit 仓库搜索..."
+                TMPDIR=$(mktemp -d)
+                if git clone --depth 1 --filter=blob:none --sparse https://github.com/unifreq/openwrt_packit.git "$TMPDIR/repo" 2>/dev/null; then
+                    cd "$TMPDIR/repo"
+                    git sparse-checkout set files 2>/dev/null || true
+                    SRC=$(find . -type f -name "meson-gxl-s905d-phicomm-n1.dtb" | head -n 1)
+                    if [ -n "${SRC:-}" ]; then
+                        cp "$SRC" "$TARGET_FILE"
+                        FOUND=1
+                        echo "✅ [源2] 成功找到并复制 DTB"
+                    fi
+                    cd - > /dev/null
+                fi
+                rm -rf "$TMPDIR"
+            fi
+
+            # === 源3: 从 Armbian build 仓库直链下载 ===
+            if [ "$FOUND" -eq 0 ]; then
+                echo "🌐 [源3] 从 Armbian build 仓库下载..."
+                URL="https://raw.githubusercontent.com/armbian/build/main/config/kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb"
+                if curl -fSL --retry 3 --connect-timeout 15 -o "$TARGET_FILE" "$URL" 2>/dev/null; then
+                    FOUND=1
+                    echo "✅ [源3] 下载成功"
+                fi
+            fi
+
+            # === 最终校验 ===
+            if [ "$FOUND" -eq 0 ] || [ ! -s "$TARGET_FILE" ]; then
+              echo "❌ FATAL: 所有源均未能获取有效 DTB！"
               exit 1
             fi
-          fi
-          
-          # 将下载的 DTB 复制到内核输出目录
-          DTB_SOURCE=$(find openwrt/bin/targets -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
-          if [ -n "$DTB_SOURCE" ]; then
-            mkdir -p /tmp/custom_kernel/dtb
-            cp "$DTB_SOURCE" /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb
-            echo "✅ DTB 已复制到内核输出目录"
-          else
-            echo "⚠️ 未找到下载的 DTB 文件，尝试默认路径..."
-            if [ -f "openwrt/bin/targets/armsr/armv8/dtb/amlogic/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-              mkdir -p /tmp/custom_kernel/dtb
-              cp "openwrt/bin/targets/armsr/armv8/dtb/amlogic/meson-gxl-s905d-phicomm-n1.dtb" /tmp/custom_kernel/dtb/
-              echo "✅ DTB 已从默认路径复制"
-            else
-              echo "❌ 无法定位 DTB 文件，所有源可能均已失败"
-              ls -la openwrt/bin/targets/armsr/armv8/dtb/amlogic/ 2>/dev/null || echo "(目录不存在)"
+
+            # 验证是否为真实 DTB 二进制
+            MAGIC=$(xxd -p -l 4 "$TARGET_FILE" 2>/dev/null || true)
+            if [ "$MAGIC" != "d00dfeed" ]; then
+              echo "❌ FATAL: 文件不是有效 DTB (魔数: $MAGIC)"
+              rm -f "$TARGET_FILE"
               exit 1
             fi
-          fi
-          
-          # 重新打包 DTB 和内核包
-          if [ -d "/tmp/custom_kernel/dtb" ] && [ "$(ls -A /tmp/custom_kernel/dtb/ 2>/dev/null)" ]; then
+
+            echo "✅ N1 DTB 注入成功! 大小: $(du -h "$TARGET_FILE" | cut -f1)"
+            ls -lh "$TARGET_FILE"
+            
+            # 重新打包 DTB 并更新 Release
             cd /tmp/custom_kernel
             rm -f dtb-amlogic-${KREL}.tar.gz
             tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-            
+
             mv dtb-amlogic-${KREL}.tar.gz wrap/${KREL}/
             cd wrap/${KREL}
             sha256sum *.tar.gz > sha256sums
             cd ..
             rm -f ${KREL}.tar.gz
             tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
-            
+
             gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
             gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Injected)"
-            echo "✅ 内核 Release 已更新，包含 N1 DTB"
-          else
-            echo "⚠️ /tmp/custom_kernel/dtb/ 为空，跳过重新打包"
           fi
 
       - name: 组装注入包
