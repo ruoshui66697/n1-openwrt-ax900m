@@ -232,12 +232,14 @@ jobs:
           else
             echo "⚠️ 缺少 N1 专用 DTB，开始多源获取..."
             
-            # 运行仓库根目录的 DTB 获取脚本
-            if [ -f "fix-n1-dtdb.sh" ]; then
-              chmod +x fix-n1-dtdb.sh
-              bash fix-n1-dtdb.sh
+            # 运行仓库根目录的 DTB 获取脚本（已修正文件名）
+            if [ -f "$GITHUB_WORKSPACE/fix-n1-dtb.sh" ]; then
+              chmod +x "$GITHUB_WORKSPACE/fix-n1-dtb.sh"
+              bash "$GITHUB_WORKSPACE/fix-n1-dtb.sh"
             else
-              echo "❌ 未找到 fix-n1-dtdb.sh 脚本！请确保该脚本已提交到仓库根目录"
+              echo "❌ 未找到 fix-n1-dtb.sh 脚本！请确保该脚本已提交到仓库根目录"
+              echo "📂 当前根目录文件："
+              ls -la "$GITHUB_WORKSPACE"
               exit 1
             fi
           fi
