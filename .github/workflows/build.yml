@@ -1,15 +1,20 @@
-name: N1 OpenWrt AX900M 固件编译 (绝对同源版)
+name: N1 OpenWrt AX900M 固件编译 (Amlogic 内核版)
 
 on:
   workflow_dispatch:
     inputs:
       openwrt_version:
-        description: 'OpenWrt 版本分支'
+        description: 'OpenWrt 版本'
         required: true
         default: 'v24.10.2'
         type: string
+      kernel_version:
+        description: 'Amlogic 内核版本 (ophub/kernel kernel_stable 标签下可用的版本)'
+        required: true
+        default: '5.15.225'
+        type: string
       driver_branch:
-        description: 'AIC8800 驱动分支 (legacy-mcu1)'
+        description: 'AIC8800 驱动分支'
         required: true
         default: 'legacy-mcu1'
         type: choice
@@ -23,79 +28,27 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 初始化与前置校验
-        run: |
-          ERR_FILE="$GITHUB_WORKSPACE/error_log.txt"
-          echo "=== Build Error Log ===" > "$ERR_FILE"
-          echo "ERR_FILE=$ERR_FILE" >> $GITHUB_ENV
-
+      # ============================================================
+      # Phase 1: 构建 OpenWrt rootfs (仅用户空间，不含内核)
+      # ============================================================
       - name: 安装编译依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gettext git libncurses-dev libssl-dev python3-setuptools rsync \
             swig unzip zlib1g-dev file wget bc libelf-dev kmod bzip2 zstd \
-            lz4 u-boot-tools cpio dosfstools libtool pkg-config autoconf automake jq
+            lz4 u-boot-tools cpio dosfstools libtool pkg-config autoconf \
+            automake jq device-tree-compiler gcc-aarch64-linux-gnu
 
       - name: 克隆 OpenWrt 源码
         run: |
-          git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} https://github.com/openwrt/openwrt.git openwrt
+          git clone --depth 1 --branch ${{ github.event.inputs.openwrt_version }} \
+            https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 注入 AIC8800 OpenWrt Package
-        run: |
-          cd openwrt
-          mkdir -p package/kernel/aic8800
-          git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} https://github.com/shenmintao/aic8800d80.git package/kernel/aic8800/src
-          
-          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed chip check/g' {} \;
-          find package/kernel/aic8800/src -name "*.c" -exec sed -i 's/return -1; \/\/ Unsupported chip/return 0; \/\/ Force support/g' {} \;
-          
-          cat > package/kernel/aic8800/Makefile <<'MAKEFILE'
-          include $(TOPDIR)/rules.mk
-          include $(INCLUDE_DIR)/kernel.mk
-          include $(INCLUDE_DIR)/package.mk
-          
-          PKG_NAME:=aic8800
-          PKG_RELEASE:=1
-          PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
-          
-          define KernelPackage/aic8800
-            SUBMENU:=Wireless Drivers
-            TITLE:=AIC8800 USB WiFi driver
-            DEPENDS:=+kmod-cfg80211 +kmod-mac80211 +kmod-usb-core
-            FILES:= \
-          	$(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko \
-          	$(PKG_BUILD_DIR)/drivers/aic8800/aic8800_fdrv.ko
-            AUTOLOAD:=$(call AutoProbe,aic8800_fdrv aic_load_fw)
-          endef
-          
-          define KernelPackage/aic8800/description
-            Out-of-tree AIC8800 USB WiFi driver.
-          endef
-          
-          define Build/Prepare
-          	rm -rf $(PKG_BUILD_DIR)
-          	mkdir -p $(PKG_BUILD_DIR)
-          	$(CP) ./src/. $(PKG_BUILD_DIR)/
-          endef
-          
-          define Build/Compile
-          	+$(KERNEL_MAKE) $(PKG_JOBS) \
-          		M="$(PKG_BUILD_DIR)/drivers/aic8800" \
-          		KBUILD_MODPOST_WARN=1 \
-          		KBUILD_EXTRA_SYMBOLS="$(KERNEL_BUILD_DIR)/symvers/mac80211.symvers" \
-          		modules
-          	find $(PKG_BUILD_DIR) -name "*.ko" -exec cp {} $(PKG_BUILD_DIR)/drivers/aic8800/ \;
-          	[ -f $(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko ] || touch $(PKG_BUILD_DIR)/drivers/aic8800/aic_load_fw.ko
-          endef
-          
-          $(eval $(call KernelPackage,aic8800))
-          MAKEFILE
-
-      - name: 生成配置
+      - name: 生成 rootfs 配置 (不含 kmod，避免与 Amlogic 内核冲突)
         run: |
           cd openwrt
           cat > .config <<'EOF'
@@ -103,6 +56,7 @@ jobs:
           CONFIG_TARGET_armsr_armv8=y
           CONFIG_TARGET_ROOTFS_TARGZ=y
           CONFIG_BINUTILS_VERSION_2_40=y
+          # --- LuCI Web 界面 ---
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_uhttpd=y
           CONFIG_PACKAGE_uhttpd-mod-ubus=y
@@ -114,31 +68,28 @@ jobs:
           CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-opkg-zh-cn=y
           CONFIG_PACKAGE_luci-i18n-wifi-zh-cn=y
+          # --- WiFi 用户空间工具 (kmod 由 Amlogic 内核提供) ---
           CONFIG_PACKAGE_wpad-mbedtls=y
           CONFIG_PACKAGE_iw=y
           CONFIG_PACKAGE_iwinfo=y
+          # --- 蓝牙 ---
           CONFIG_PACKAGE_bluez-daemon=y
           CONFIG_PACKAGE_bluez-utils=y
+          # --- USB ---
           CONFIG_PACKAGE_usbutils=y
+          CONFIG_PACKAGE_libusb-1.0=y
+          # --- 多线多拨 ---
           CONFIG_PACKAGE_mwan3=y
           CONFIG_PACKAGE_luci-app-mwan3=y
-          CONFIG_PACKAGE_kmod-cfg80211=y
-          CONFIG_PACKAGE_kmod-mac80211=y
-          CONFIG_PACKAGE_kmod-usb-core=y
-          CONFIG_PACKAGE_kmod-usb-storage=y
-          CONFIG_PACKAGE_libusb-1.0=y
-          CONFIG_PACKAGE_kmod-aic8800=y
           EOF
           make defconfig
 
-      - name: 下载依赖与清理
+      - name: 下载依赖
         run: |
           cd openwrt
           make download -j$(nproc) || make download -j1 V=s
-          rm -rf staging_dir/host staging_dir/toolchain-* build_dir/toolchain-* build_dir/host
-          make defconfig
 
-      - name: 修复 cp 兼容性
+      - name: 修复 cp 兼容性 (Ubuntu 22.04)
         run: |
           sudo mv /usr/bin/cp /usr/bin/cp.orig
           sudo tee /usr/bin/cp > /dev/null <<'EOF'
@@ -153,307 +104,274 @@ jobs:
           EOF
           sudo chmod +x /usr/bin/cp
 
-      - name: 编译 OpenWrt
+      - name: 编译 OpenWrt rootfs
         run: |
           cd openwrt
-          if ! make -j3 2>>"$ERR_FILE"; then
-            echo "❌ 并发编译失败，尝试单线程排查..."
-            make -j1 V=s 2>&1 | tee -a "$ERR_FILE"
+          if ! make -j$(nproc) 2>&1 | tee /tmp/build.log; then
+            echo "❌ 并发编译失败，尝试单线程..."
+            make -j1 V=s 2>&1 | tee -a /tmp/build.log
             exit 1
           fi
 
-      - name: 提取内核并发布到当前仓库 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 验证 rootfs 产物
         run: |
-          cd openwrt
-          KREL=$(ls staging_dir/target-*/root-*/lib/modules/ 2>/dev/null | grep -E "^6" | head -n 1)
-          if [ -z "$KREL" ]; then
-             echo "❌ 找不到内核模块目录，编译失败！"
-             exit 1
-          fi
-          echo "KREL=${KREL}" >> $GITHUB_ENV
-          
-          LINUX_DIR=$(find build_dir/target-*/linux-*/linux-* -maxdepth 0 -type d | head -n 1)
-          if [ ! -d "$LINUX_DIR" ]; then
-             echo "❌ 找不到 Linux 编译目录！"
-             exit 1
-          fi
-          
-          mkdir -p /tmp/custom_kernel/boot /tmp/custom_kernel/dtb /tmp/custom_kernel/modules
-          
-          cp "$LINUX_DIR/arch/arm64/boot/Image" /tmp/custom_kernel/boot/vmlinuz-${KREL}
-          cp "$LINUX_DIR/.config" /tmp/custom_kernel/boot/config-${KREL}
-          cp "$LINUX_DIR/System.map" /tmp/custom_kernel/boot/System.map-${KREL}
-          
-          # armsr 目标没有 amlogic dtb，这里会是空的，后续单独补充
-          cp "$LINUX_DIR"/arch/arm64/boot/dts/amlogic/*.dtb /tmp/custom_kernel/dtb/ 2>/dev/null || true
-          
-          cp -a staging_dir/target-*/root-*/lib/modules/${KREL} /tmp/custom_kernel/modules/
-
-          echo "正在生成 uInitrd-${KREL} ..."
-          echo | cpio -o -H newc 2>/dev/null | gzip -9 > /tmp/initrd.gz
-          mkimage -A arm64 -O linux -T ramdisk -C gzip -d /tmp/initrd.gz /tmp/custom_kernel/boot/uInitrd-${KREL}
-
-          cd /tmp/custom_kernel
-          tar czf boot-${KREL}.tar.gz --owner=0 --group=0 -C boot .
-          tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-          tar czf modules-${KREL}.tar.gz --owner=0 --group=0 -C modules ${KREL}
-
-          mkdir -p wrap/${KREL}
-          mv boot-${KREL}.tar.gz dtb-amlogic-${KREL}.tar.gz modules-${KREL}.tar.gz wrap/${KREL}/
-          cd wrap/${KREL}
-          sha256sum *.tar.gz > sha256sums
-          cd ..
-          tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
-
-          gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
-          gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL}"
-
-      - name: 补充 N1 专用 DTB (关键修复)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          KREL="${{ env.KREL }}"
-          if [ -z "$KREL" ]; then
-            echo "❌ KREL 为空，跳过 DTB 补充"
+          ROOTFS="openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          if [ ! -f "$ROOTFS" ]; then
+            echo "❌ rootfs 文件不存在: $ROOTFS"
+            ls -la openwrt/bin/targets/armsr/armv8/ 2>/dev/null || true
             exit 1
           fi
-          
+          echo "✅ rootfs 大小: $(du -h "$ROOTFS" | cut -f1)"
+
+      # ============================================================
+      # Phase 2: 获取 Amlogic 预编译内核 (ophub/kernel)
+      # ============================================================
+      - name: 下载 Amlogic 预编译内核
+        run: |
+          KVER="${{ github.event.inputs.kernel_version }}"
+          echo "KVER=${KVER}" >> $GITHUB_ENV
+
+          KERNEL_URL="https://github.com/ophub/kernel/releases/download/kernel_stable/${KVER}.tar.gz"
+          echo "📥 下载内核: ${KERNEL_URL}"
+          wget -q --timeout=120 --tries=3 "${KERNEL_URL}" -O /tmp/kernel.tar.gz
+
+          if [ ! -s /tmp/kernel.tar.gz ]; then
+            echo "❌ 内核下载失败"
+            echo "请访问 https://github.com/ophub/kernel/releases/tag/kernel_stable 查看可用版本"
+            exit 1
+          fi
+
+          mkdir -p /tmp/kernel
+          tar xzf /tmp/kernel.tar.gz -C /tmp/kernel
+          echo "✅ 内核下载成功"
+          echo "📂 内核包内容:"
+          find /tmp/kernel -type f -name "*.tar.gz" | sort
+
+      - name: 校验内核包完整性
+        run: |
+          KVER="${{ env.KVER }}"
+          KDIR="/tmp/kernel/${KVER}"
+
+          BOOT_TAR=$(ls "${KDIR}"/boot-${KVER}*.tar.gz 2>/dev/null | head -1)
+          DTB_TAR=$(ls "${KDIR}"/dtb-amlogic-${KVER}*.tar.gz 2>/dev/null | head -1)
+          MOD_TAR=$(ls "${KDIR}"/modules-${KVER}*.tar.gz 2>/dev/null | head -1)
+
+          if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MOD_TAR" ]; then
+            echo "❌ 内核包缺少必要文件"
+            echo "  boot: ${BOOT_TAR:-缺失}"
+            echo "  dtb:  ${DTB_TAR:-缺失}"
+            echo "  mods: ${MOD_TAR:-缺失}"
+            exit 1
+          fi
+
           mkdir -p /tmp/dtb_check
-          tar xzf /tmp/custom_kernel/wrap/${KREL}/dtb-amlogic-${KREL}.tar.gz -C /tmp/dtb_check
-          
-          if [ ! -f "/tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb" ]; then
-            echo "⚠️ 缺少 N1 专用 DTB，开始提取..."
-            
-            # 固定 tag=dtb 的直链，不依赖 latest API，避免限流和命名变更
-            DTB_URLS=(
-              "https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/dtb/dtb-amlogic.tar.gz"
-              "https://github.com/ophub/amlogic-s9xxx-openwrt/releases/download/dtb/dtb-amlogic.tar.gz"
-              "https://github.com/unifreq/openwrt_packit/releases/download/dtb/dtb-amlogic.tar.gz"
-            )
-            
-            DOWNLOAD_OK=false
-            for url in "${DTB_URLS[@]}"; do
-              echo "📥 尝试下载: $url"
-              if wget -q --timeout=60 --tries=2 \
-                   --header="Authorization: token ${GH_TOKEN}" \
-                   "$url" -O /tmp/dtb-amlogic.tar.gz 2>/dev/null; then
-                if [ -s /tmp/dtb-amlogic.tar.gz ] && file /tmp/dtb-amlogic.tar.gz | grep -q gzip; then
-                  echo "✅ 下载成功: $url"
-                  DOWNLOAD_OK=true
-                  break
-                else
-                  echo "⚠️ 文件无效，尝试下一个源..."
-                  rm -f /tmp/dtb-amlogic.tar.gz
-                fi
-              else
-                echo "⚠️ 下载失败，尝试下一个源..."
-              fi
-            done
-            
-            if [ "$DOWNLOAD_OK" != "true" ]; then
-              echo "❌ 所有 DTB 源均下载失败"
-              exit 1
-            fi
-            
-            echo "🔧 解压并查找 N1 DTB..."
-            mkdir -p /tmp/dtb_extract
-            tar xzf /tmp/dtb-amlogic.tar.gz -C /tmp/dtb_extract
-            
-            FOUND_DTB=$(find /tmp/dtb_extract -name "meson-gxl-s905d-phicomm-n1.dtb" -type f 2>/dev/null | head -n 1)
-            if [ -z "$FOUND_DTB" ]; then
-              echo "❌ DTB 包中未找到 meson-gxl-s905d-phicomm-n1.dtb"
-              echo "📋 包内可用 DTB 列表:"
-              find /tmp/dtb_extract -name "*.dtb" -type f | sort | head -30
-              exit 1
-            fi
-            
-            cp "$FOUND_DTB" /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb
-            echo "✅ N1 DTB 提取成功 ($(stat -c%s /tmp/custom_kernel/dtb/meson-gxl-s905d-phicomm-n1.dtb) bytes)"
-            
-            cd /tmp/custom_kernel
-            rm -f dtb-amlogic-${KREL}.tar.gz
-            tar czf dtb-amlogic-${KREL}.tar.gz --owner=0 --group=0 -C dtb .
-            
-            mv dtb-amlogic-${KREL}.tar.gz wrap/${KREL}/
-            cd wrap/${KREL}
-            sha256sum *.tar.gz > sha256sums
-            cd ..
-            rm -f ${KREL}.tar.gz
-            tar czf ${KREL}.tar.gz --owner=0 --group=0 ${KREL}
-            
-            gh release delete "kernel_stable" --cleanup-tag -y --repo ${{ github.repository }} 2>/dev/null || true
-            gh release create "kernel_stable" ${KREL}.tar.gz --repo ${{ github.repository }} -t "kernel_stable" -n "Kernel: ${KREL} (N1 DTB Fixed)"
-          else
-            echo "✅ N1 DTB 已存在，无需补充"
+          tar xzf "$DTB_TAR" -C /tmp/dtb_check
+          if [ ! -f /tmp/dtb_check/meson-gxl-s905d-phicomm-n1.dtb ]; then
+            echo "❌ 内核包中缺少 N1 DTB"
+            echo "可用 DTB:"
+            find /tmp/dtb_check -name "*.dtb" | head -20
+            exit 1
+          fi
+          echo "✅ 内核包完整性校验通过，N1 DTB 已确认存在"
+
+      # ============================================================
+      # Phase 3: 编译 AIC8800 WiFi 驱动模块
+      # ============================================================
+      - name: 准备内核头文件
+        run: |
+          KVER="${{ env.KVER }}"
+          HEADER_TAR=$(ls /tmp/kernel/${KVER}/header-${KVER}*.tar.gz 2>/dev/null | head -1)
+
+          if [ -z "$HEADER_TAR" ]; then
+            echo "⚠️ 内核包中无头文件，AIC8800 模块将跳过编译"
+            echo "固件仍可启动，但无 WiFi 功能"
+            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            exit 0
           fi
 
+          echo "📦 解压内核头文件..."
+          mkdir -p /tmp/kernel-headers
+          tar xzf "$HEADER_TAR" -C /tmp/kernel-headers
+
+          KSRC_DIR=$(find /tmp/kernel-headers -maxdepth 2 -name "Makefile" \
+            -path "*/linux-*" -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+
+          if [ -z "$KSRC_DIR" ] || [ ! -d "$KSRC_DIR" ]; then
+            echo "⚠️ 头文件目录结构不符合预期，跳过 AIC8800 编译"
+            ls -laR /tmp/kernel-headers/ | head -30
+            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "KSRC_DIR=${KSRC_DIR}" >> $GITHUB_ENV
+
+          cd "$KSRC_DIR"
+          if [ -f config.gz ]; then
+            gunzip -c config > .config
+          fi
+
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            modules_prepare 2>&1 | tail -5 || true
+
+          echo "✅ 内核头文件准备完成"
+          echo "SKIP_AIC8800=false" >> $GITHUB_ENV
+
+      - name: 编译 AIC8800 驱动模块
+        if: env.SKIP_AIC8800 != 'true'
+        run: |
+          KVER="${{ env.KVER }}"
+          KSRC_DIR="${{ env.KSRC_DIR }}"
+
+          echo "🔧 克隆 AIC8800 驱动源码..."
+          git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
+            https://github.com/shenmintao/aic8800d80.git /tmp/aic8800
+
+          find /tmp/aic8800 -name "*.c" -exec \
+            sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed/g' {} \;
+          find /tmp/aic8800 -name "*.c" -exec \
+            sed -i 's/return -1; \/\/ Unsupported chip/return 0;/g' {} \;
+
+          DRIVER_MAKE=$(find /tmp/aic8800 -maxdepth 2 -name "Makefile" -type f | head -1)
+          if [ -z "$DRIVER_MAKE" ]; then
+            echo "⚠️ 未找到 AIC8800 Makefile，跳过"
+            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          DRIVER_DIR=$(dirname "$DRIVER_MAKE")
+          cd "$DRIVER_DIR"
+
+          EXTRA_SYM=""
+          [ -f "${KSRC_DIR}/Module.symvers" ] && \
+            EXTRA_SYM="KBUILD_EXTRA_SYMBOLS=${KSRC_DIR}/Module.symvers"
+
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KVER="${KVER}" \
+            KSRC="${KSRC_DIR}" \
+            ${EXTRA_SYM} \
+            -j$(nproc) 2>&1 | tee /tmp/aic8800_build.log || {
+              echo "⚠️ AIC8800 编译失败，固件仍可启动但无 WiFi"
+              tail -30 /tmp/aic8800_build.log
+              echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+              exit 0
+            }
+
+          mkdir -p /tmp/aic8800_modules
+          find /tmp/aic8800 -name "*.ko" -exec cp {} /tmp/aic8800_modules/ \;
+
+          if [ -z "$(ls /tmp/aic8800_modules/*.ko 2>/dev/null)" ]; then
+            echo "⚠️ 未找到 .ko 文件"
+            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "✅ AIC8800 编译成功:"
+          ls -la /tmp/aic8800_modules/
+
+      # ============================================================
+      # Phase 4: 组装注入包
+      # ============================================================
       - name: 组装注入包
         run: |
-          KREL="${{ env.KREL }}"
-          mkdir -p inject/usr/sbin inject/lib/firmware inject/etc/usb_modeswitch.d inject/etc/hotplug.d/usb inject/etc/profile.d inject/etc/uci-defaults inject/etc/init.d inject/etc/udev/rules.d
-          
-          # 仅使用标准 /lib/modules 路径
-          mkdir -p inject/lib/modules/${KREL}
-          if [ -d "/tmp/custom_kernel/modules/${KREL}" ]; then
-            cp -a /tmp/custom_kernel/modules/${KREL}/. inject/lib/modules/${KREL}/
-          fi
-          
-          # 验证模块目录
-          if [ ! -d "inject/lib/modules/${KREL}/kernel" ]; then
-            echo "⚠️ 警告: 模块目录缺少 kernel 子目录"
-            mkdir -p inject/lib/modules/${KREL}/kernel/drivers/aic8800
-          fi
-          echo "✅ 模块目录结构:"
-          ls -la inject/lib/modules/${KREL}/ | head -10
+          KVER="${{ env.KVER }}"
+          INJECT="$GITHUB_WORKSPACE/inject"
+          mkdir -p "$INJECT"/usr/sbin \
+                   "$INJECT"/lib/firmware \
+                   "$INJECT"/etc/hotplug.d/usb \
+                   "$INJECT"/etc/uci-defaults \
+                   "$INJECT"/etc/init.d
 
-          # 复制 AIC8800 固件
-          if [ -d "openwrt/package/kernel/aic8800/src/fw" ]; then
-            cp -r openwrt/package/kernel/aic8800/src/fw/. inject/lib/firmware/
-            echo "✅ AIC8800 固件已注入"
+          # --- AIC8800 模块 ---
+          if [ "${{ env.SKIP_AIC8800 }}" != "true" ] && [ -d /tmp/aic8800_modules ]; then
+            mkdir -p "$INJECT/lib/modules/${KVER}/kernel/drivers/aic8800"
+            cp /tmp/aic8800_modules/*.ko \
+               "$INJECT/lib/modules/${KVER}/kernel/drivers/aic8800/" 2>/dev/null || true
+            echo "✅ AIC8800 模块已注入"
           else
-            echo "⚠️ 未找到 AIC8800 固件目录"
+            echo "⚠️ 跳过 AIC8800 模块注入"
           fi
 
-          wget -q "https://github.com/telemt/telemt/releases/download/toolchains/aarch64-linux-musl-cross.tgz" -O /tmp/cross.tgz
-          tar xzf /tmp/cross.tgz -C /tmp
-          export PATH=/tmp/aarch64-linux-musl-cross/bin:$PATH
+          # --- AIC8800 固件 ---
+          if [ -d /tmp/aic8800/fw ]; then
+            cp -r /tmp/aic8800/fw/. "$INJECT/lib/firmware/"
+            echo "✅ AIC8800 固件已注入"
+          fi
 
-          git clone --depth 1 https://github.com/libusb/libusb.git libusb-src || true
-          cd libusb-src
-          ./autogen.sh --host=aarch64-linux-musl --enable-static --disable-shared --disable-udev --prefix=/tmp/usbroot >/dev/null
-          make -j$(nproc) >/dev/null && make install >/dev/null
-          cd ..
-
-          curl -fsSL "https://www.draisberghof.de/usb_modeswitch/usb-modeswitch-2.6.1.tar.bz2" -o /tmp/ums.tar.bz2
-          tar xjf /tmp/ums.tar.bz2 -C /tmp
-          cd /tmp/usb-modeswitch-2.6.1
-          aarch64-linux-musl-gcc -static -O2 -o usb_modeswitch usb_modeswitch.c -I/tmp/usbroot/include/libusb-1.0 -L/tmp/usbroot/lib -lusb-1.0 -lpthread 2>>"$ERR_FILE"
-          cp usb_modeswitch "$GITHUB_WORKSPACE/inject/usr/sbin/"
-          chmod +x "$GITHUB_WORKSPACE/inject/usr/sbin/usb_modeswitch"
-
-          cat > "$GITHUB_WORKSPACE/inject/etc/usb_modeswitch.d/1111:1111" <<'EOF'
-          DefaultVendor=0x1111
-          DefaultProduct=0x1111
-          TargetVendor=0xa69c
-          TargetProduct=0x8d81
-          MessageContent="555342438765432100000000000010fd0000000000000000000000000000f3"
-          MessageContent2="555342438765432100000000000010fd0000000000000000000000000000f2"
-          EOF
-
-          cat > "$GITHUB_WORKSPACE/inject/etc/udev/rules.d/99-usb-permissions.rules" <<'EOF'
-          SUBSYSTEM=="usb", MODE="0666"
-          SUBSYSTEM=="usb_device", MODE="0666"
-          EOF
-
-          cat > "$GITHUB_WORKSPACE/inject/usr/sbin/switch_card.sh" <<'EOF'
-          #!/bin/sh
-          LOCK_FILE="/tmp/.aic8800_switching"
-          if [ -f "$LOCK_FILE" ]; then exit 0; fi
-          touch "$LOCK_FILE"
-          chmod 666 /dev/bus/usb/*/* 2>/dev/null
-          /usr/sbin/usb_modeswitch -W -c /etc/usb_modeswitch.d/1111:1111 >/dev/null 2>&1
-          rm -f "$LOCK_FILE"
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/inject/usr/sbin/switch_card.sh"
-
-          cat > "$GITHUB_WORKSPACE/inject/etc/hotplug.d/usb/99-aic8800" <<'EOF'
+          # --- USB 热插拔脚本 ---
+          if [ "${{ env.SKIP_AIC8800 }}" != "true" ]; then
+            cat > "$INJECT/etc/hotplug.d/usb/99-aic8800" <<'HPEOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
           KVER=$(uname -r)
           MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
-          FW_DIR="/lib/firmware"
-          
-          # 检查固件是否存在，避免驱动加载崩溃
-          if [ ! -f "$FW_DIR/aic8800d80_fw.bin" ] && [ ! -f "$FW_DIR/aic8800_fw.bin" ]; then
-            logger -t aic8800 "Firmware not found, skip driver load"
-            exit 0
-          fi
-          
           case "$PRODUCT" in
-              1111/1111/*) 
-                sleep 2
-                /usr/sbin/switch_card.sh 
+              a69c/8d81/*|368b/8d81/*)
+                modprobe cfg80211 2>/dev/null
+                modprobe mac80211 2>/dev/null
+                insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null || true
+                sleep 1
+                insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null || true
                 ;;
-              a69c/8d81/*|368b/8d81/*) 
-                  modprobe cfg80211 2>/dev/null
-                  modprobe mac80211 2>/dev/null
-                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null || true
-                  sleep 1
-                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null || true
-                  modprobe btusb 2>/dev/null 
-                  ;;
           esac
           exit 0
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/inject/etc/hotplug.d/usb/99-aic8800"
+          HPEOF
+            chmod +x "$INJECT/etc/hotplug.d/usb/99-aic8800"
+          fi
 
-          cat > "$GITHUB_WORKSPACE/inject/etc/rc.local" <<'EOF'
-          #!/bin/sh
-          KVER=$(uname -r)
-          MOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"
-          i=0
-          while [ $i -lt 20 ]; do
-              if grep -qiE "a69c|368b" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then
-                  modprobe cfg80211 2>/dev/null
-                  modprobe mac80211 2>/dev/null
-                  insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null || true
-                  sleep 1
-                  insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null || true
-                  break
-              fi
-              if grep -q "1111" /sys/bus/usb/devices/*/idVendor 2>/dev/null; then /usr/sbin/switch_card.sh; fi
-              sleep 3; i=$((i+3))
-          done
-          exit 0
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/inject/etc/rc.local"
+          # --- 默认 LAN IP ---
+          printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' \
+            > "$INJECT/etc/uci-defaults/99-set-lan-ip"
+          chmod +x "$INJECT/etc/uci-defaults/99-set-lan-ip"
 
-          cat > "$GITHUB_WORKSPACE/inject/etc/init.d/usbfs" <<'EOF'
-          #!/bin/sh /etc/rc.common
-          START=10
-          start() {
-              mkdir -p /dev/bus/usb
-              mountpoint -q /dev/bus/usb || mount -t devtmpfs devtmpfs /dev/bus/usb 2>/dev/null
-              [ -x /sbin/udevadm ] && udevadm settle --timeout=5 2>/dev/null
-              [ -x /sbin/udevadm ] && udevadm trigger --subsystem-match=usb 2>/dev/null
-              for i in 1 2 3; do find /dev/bus/usb -type c -exec chmod 666 {} \; 2>/dev/null; sleep 1; done
-          }
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/inject/etc/init.d/usbfs"
+          echo "✅ 注入包组装完成"
+          find "$INJECT" -type f | sort
 
-          cat > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-zh-cn" <<'EOF'
-          #!/bin/sh
-          uci set luci.main.lang="zh_cn" 2>/dev/null && uci commit luci 2>/dev/null
-          exit 0
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-zh-cn"
-          printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' > "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
-          chmod +x "$GITHUB_WORKSPACE/inject/etc/uci-defaults/99-set-lan-ip"
-
+      # ============================================================
+      # Phase 5: 使用 ophub 打包为 N1 固件
+      # ============================================================
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
           openwrt_path: openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz
           openwrt_board: s905d
-          kernel_repo: ${{ github.repository }}
-          openwrt_kernel: ${{ env.KREL }}
+          kernel_repo: ophub/kernel
+          openwrt_kernel: ${{ env.KVER }}
           auto_kernel: false
           openwrt_files: inject
 
-      - name: 恢复系统 cp 命令
+      - name: 恢复系统 cp
         if: always()
         run: |
-          if [ -f /usr/bin/cp.orig ]; then sudo mv /usr/bin/cp.orig /usr/bin/cp; fi
+          [ -f /usr/bin/cp.orig ] && sudo mv /usr/bin/cp.orig /usr/bin/cp || true
 
-      - name: 上传固件
+      # ============================================================
+      # Phase 6: 上传产物
+      # ============================================================
+      - name: 上传固件到 Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: N1-OpenWrt-AX900M-${{ env.KREL }}
+          name: N1-OpenWrt-AX900M-${{ env.KVER }}
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
+          if-no-files-found: error
 
-      - name: 构建结果推送到钉钉
+      - name: 推送固件到 GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KVER="${{ env.KVER }}"
+          TAG_NAME="openwrt-n1-${KVER}"
+          IMG_FILE=$(find ${{ env.PACKAGED_OUTPUTPATH }} -name "*.img.gz" | head -1)
+          if [ -n "$IMG_FILE" ]; then
+            gh release create "${TAG_NAME}" "$IMG_FILE" \
+              --repo ${{ github.repository }} \
+              -t "N1 OpenWrt (Kernel ${KVER})" \
+              -n "OpenWrt ${{ github.event.inputs.openwrt_version }} + Amlogic Kernel ${KVER}" \
+              --generate-notes 2>/dev/null || echo "⚠️ Release 创建失败 (可能已存在)"
+          fi
+
+      - name: 推送结果到钉钉
         if: always()
         env:
           DINGTALK_TOKEN: ${{ secrets.DINGTALK_TOKEN }}
@@ -461,36 +379,28 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           JOB_STATUS: ${{ job.status }}
-          KERNEL_VER: ${{ env.KREL }}
+          KERNEL_VER: ${{ env.KVER }}
         run: |
           RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
-          ERR_FILE="$GITHUB_WORKSPACE/error_log.txt"
-          
           if [ "$JOB_STATUS" = "success" ]; then
-            TITLE="[openwrt N1] ✅ 构建成功 (内核: $KERNEL_VER)"
-            CONTENT="固件已编译完成，内核版本严格锁定为 $KERNEL_VER，N1 DTB 已注入。去 Actions 下载刷机即可。"
+            TITLE="[N1 OpenWrt] ✅ 构建成功 (内核: $KERNEL_VER)"
+            CONTENT="Amlogic 内核 ${KERNEL_VER}，N1 DTB 已内置。"
+            [ "${{ env.SKIP_AIC8800 }}" = "true" ] && \
+              CONTENT="${CONTENT}\n⚠️ AIC8800 WiFi 未编译" || \
+              CONTENT="${CONTENT}\n✅ AIC8800 WiFi 已包含"
           else
-            TITLE="[openwrt N1] ❌ 构建失败"
-            ERR_SUMMARY=""
-            if [ -f "$ERR_FILE" ]; then ERR_SUMMARY=$(grep '❌' "$ERR_FILE" | tail -5 || true); fi
-            if [ -n "$ERR_SUMMARY" ]; then
-              CONTENT="错误摘要:\n${ERR_SUMMARY}\n请查看 Artifacts 中的 build-error-log。"
+            TITLE="[N1 OpenWrt] ❌ 构建失败"
+            CONTENT="查看日志: $RUN_URL"
+          fi
+          PAYLOAD=$(jq -n --arg t "$TITLE" --arg c "$CONTENT" --arg u "$RUN_URL" \
+            '{msgtype:"text",text:{content:($t+"\n"+$c+"\n"+$u)}}')
+          if [ -n "$DINGTALK_TOKEN" ]; then
+            if [ -n "$DINGTALK_SECRET" ]; then
+              TS=$(date +%s000)
+              SIGN=$(echo -n "${TS}\n${DINGTALK_SECRET}" | openssl dgst -sha256 -hmac "$DINGTALK_SECRET" -binary | base64 | sed 's/+/%20/g;s/\//%2F/g;s/=/%3D/g')
+              WH="https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}&timestamp=${TS}&sign=${SIGN}"
             else
-              CONTENT="请到 Actions 查看失败步骤日志。"
+              WH="https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}"
             fi
+            curl -sS -X POST "$WH" -H "Content-Type: application/json" -d "$PAYLOAD" || true
           fi
-          
-          FORMATTED_CONTENT=$(printf "%b" "$CONTENT")
-          PAYLOAD=$(jq -n --arg title "$TITLE" --arg content "$FORMATTED_CONTENT" --arg url "$RUN_URL" '{msgtype:"text", text:{content: ($title + "\n" + $content + "\n" + $url)}}')
-          
-          if [ -n "$DINGTALK_SECRET" ]; then
-            TIMESTAMP=$(date +%s000)
-            STRING_TO_SIGN="${TIMESTAMP}\n${DINGTALK_SECRET}"
-            SIGN=$(echo -n "$STRING_TO_SIGN" | openssl dgst -sha256 -hmac "$DINGTALK_SECRET" -binary | base64 | sed 's/+/%20/g;s/\//%2F/g;s/=/%3D/g')
-            WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}&timestamp=${TIMESTAMP}&sign=${SIGN}"
-          else
-            WEBHOOK="https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}"
-          fi
-
-          RESPONSE=$(curl -sS -X POST "$WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD")
-          echo "钉钉接口返回: $RESPONSE"
