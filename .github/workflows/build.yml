@@ -178,28 +178,44 @@ jobs:
       # Phase 3: 编译 AIC8800 WiFi 驱动模块
       # ============================================================
       - name: 准备内核头文件
+        id: prepare_headers
         run: |
           KVER="${{ env.KVER }}"
-          HEADER_TAR=$(ls /tmp/kernel/${KVER}/header-${KVER}*.tar.gz 2>/dev/null | head -1)
+          KDIR="/tmp/kernel/${KVER}"
+
+          echo "📂 内核包内容:"
+          ls -la "${KDIR}/"
+
+          HEADER_TAR=$(ls "${KDIR}"/header-${KVER}*.tar.gz 2>/dev/null | head -1)
 
           if [ -z "$HEADER_TAR" ]; then
-            echo "⚠️ 内核包中无头文件，AIC8800 模块将跳过编译"
+            echo "⚠️ 内核包中无头文件 (header-${KVER}*.tar.gz)"
             echo "固件仍可启动，但无 WiFi 功能"
-            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "📦 解压内核头文件..."
-          mkdir -p /tmp/kernel-headers
-          tar xzf "$HEADER_TAR" -C /tmp/kernel-headers
+          echo "📦 头文件包: ${HEADER_TAR} ($(du -h "$HEADER_TAR" | cut -f1))"
+          file "$HEADER_TAR"
 
-          KSRC_DIR=$(find /tmp/kernel-headers -maxdepth 2 -name "Makefile" \
-            -path "*/linux-*" -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+          mkdir -p /tmp/kernel-headers
+          if ! tar xzf "$HEADER_TAR" -C /tmp/kernel-headers 2>&1; then
+            echo "❌ 头文件解压失败，尝试查看包内容..."
+            tar tzf "$HEADER_TAR" 2>&1 | head -20 || true
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "📂 解压后内容:"
+          find /tmp/kernel-headers -maxdepth 3 -type f | head -30
+
+          KSRC_DIR=$(find /tmp/kernel-headers -maxdepth 3 -name "Makefile" \
+            -type f 2>/dev/null | xargs -I{} dirname {} | sort -u | head -1)
 
           if [ -z "$KSRC_DIR" ] || [ ! -d "$KSRC_DIR" ]; then
-            echo "⚠️ 头文件目录结构不符合预期，跳过 AIC8800 编译"
-            ls -laR /tmp/kernel-headers/ | head -30
-            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            echo "⚠️ 头文件目录结构不符合预期"
+            find /tmp/kernel-headers -maxdepth 2 -type d | head -20
+            echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -214,11 +230,18 @@ jobs:
             modules_prepare 2>&1 | tail -5 || true
 
           echo "✅ 内核头文件准备完成"
-          echo "SKIP_AIC8800=false" >> $GITHUB_ENV
+          echo "skip=false" >> $GITHUB_OUTPUT
 
       - name: 编译 AIC8800 驱动模块
-        if: env.SKIP_AIC8800 != 'true'
+        id: build_aic8800
         run: |
+          SKIP="${{ steps.prepare_headers.outputs.skip }}"
+          if [ "$SKIP" = "true" ]; then
+            echo "⏭️ 跳过 AIC8800 编译"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           KVER="${{ env.KVER }}"
           KSRC_DIR="${{ env.KSRC_DIR }}"
 
@@ -233,8 +256,8 @@ jobs:
 
           DRIVER_MAKE=$(find /tmp/aic8800 -maxdepth 2 -name "Makefile" -type f | head -1)
           if [ -z "$DRIVER_MAKE" ]; then
-            echo "⚠️ 未找到 AIC8800 Makefile，跳过"
-            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            echo "⚠️ 未找到 AIC8800 Makefile"
+            echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -245,29 +268,30 @@ jobs:
           [ -f "${KSRC_DIR}/Module.symvers" ] && \
             EXTRA_SYM="KBUILD_EXTRA_SYMBOLS=${KSRC_DIR}/Module.symvers"
 
-          make ARCH=arm64 \
+          if ! make ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KVER="${KVER}" \
             KSRC="${KSRC_DIR}" \
             ${EXTRA_SYM} \
-            -j$(nproc) 2>&1 | tee /tmp/aic8800_build.log || {
-              echo "⚠️ AIC8800 编译失败，固件仍可启动但无 WiFi"
-              tail -30 /tmp/aic8800_build.log
-              echo "SKIP_AIC8800=true" >> $GITHUB_ENV
-              exit 0
-            }
+            -j$(nproc) 2>&1 | tee /tmp/aic8800_build.log; then
+            echo "⚠️ AIC8800 编译失败，固件仍可启动但无 WiFi"
+            tail -30 /tmp/aic8800_build.log
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
           mkdir -p /tmp/aic8800_modules
           find /tmp/aic8800 -name "*.ko" -exec cp {} /tmp/aic8800_modules/ \;
 
           if [ -z "$(ls /tmp/aic8800_modules/*.ko 2>/dev/null)" ]; then
             echo "⚠️ 未找到 .ko 文件"
-            echo "SKIP_AIC8800=true" >> $GITHUB_ENV
+            echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           echo "✅ AIC8800 编译成功:"
           ls -la /tmp/aic8800_modules/
+          echo "skip=false" >> $GITHUB_OUTPUT
 
       # ============================================================
       # Phase 4: 组装注入包
@@ -283,7 +307,8 @@ jobs:
                    "$INJECT"/etc/init.d
 
           # --- AIC8800 模块 ---
-          if [ "${{ env.SKIP_AIC8800 }}" != "true" ] && [ -d /tmp/aic8800_modules ]; then
+          SKIP="${{ steps.build_aic8800.outputs.skip }}"
+          if [ "$SKIP" != "true" ] && [ -d /tmp/aic8800_modules ]; then
             mkdir -p "$INJECT/lib/modules/${KVER}/kernel/drivers/aic8800"
             cp /tmp/aic8800_modules/*.ko \
                "$INJECT/lib/modules/${KVER}/kernel/drivers/aic8800/" 2>/dev/null || true
@@ -299,7 +324,7 @@ jobs:
           fi
 
           # --- USB 热插拔脚本 ---
-          if [ "${{ env.SKIP_AIC8800 }}" != "true" ]; then
+          if [ "$SKIP" != "true" ]; then
             cat > "$INJECT/etc/hotplug.d/usb/99-aic8800" <<'HPEOF'
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
@@ -383,13 +408,16 @@ jobs:
         run: |
           RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
           if [ "$JOB_STATUS" = "success" ]; then
-            TITLE="[N1 OpenWrt] ✅ 构建成功 (内核: $KERNEL_VER)"
+            TITLE="[N1 OpenWrt] 构建成功 (内核: $KERNEL_VER)"
             CONTENT="Amlogic 内核 ${KERNEL_VER}，N1 DTB 已内置。"
-            [ "${{ env.SKIP_AIC8800 }}" = "true" ] && \
-              CONTENT="${CONTENT}\n⚠️ AIC8800 WiFi 未编译" || \
-              CONTENT="${CONTENT}\n✅ AIC8800 WiFi 已包含"
+            SKIP="${{ steps.build_aic8800.outputs.skip }}"
+            if [ "$SKIP" = "true" ]; then
+              CONTENT="${CONTENT} AIC8800 WiFi 未编译。"
+            else
+              CONTENT="${CONTENT} AIC8800 WiFi 已包含。"
+            fi
           else
-            TITLE="[N1 OpenWrt] ❌ 构建失败"
+            TITLE="[N1 OpenWrt] 构建失败"
             CONTENT="查看日志: $RUN_URL"
           fi
           PAYLOAD=$(jq -n --arg t "$TITLE" --arg c "$CONTENT" --arg u "$RUN_URL" \
