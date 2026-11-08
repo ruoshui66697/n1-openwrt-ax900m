@@ -134,10 +134,13 @@ jobs:
           scripts/config --enable REGULATOR
           scripts/config --enable THERMAL
 
+          # 设置内核本地版本后缀，让模块目录名与 KNAME 匹配
+          scripts/config --set-str LOCALVERSION "-self"
+
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
           echo "内核配置完成"
-          grep -E "ARCH_MESON|CFG80211|MAC80211|USB_SUPPORT" .config | head -10
+          grep -E "ARCH_MESON|CFG80211|MAC80211|USB_SUPPORT|LOCALVERSION" .config | head -10
 
       - name: 编译内核 Image + DTB + 模块
         run: |
@@ -333,19 +336,19 @@ jobs:
 
           SKIP="${{ steps.build_aic8800.outputs.skip }}"
           if [ "$SKIP" != "true" ] && [ -d /tmp/aic8800_modules ]; then
-            MOD_DIR="/tmp/kernel_pkg/${KNAME}/modules/lib/modules/${KVER}"
+            MOD_DIR="/tmp/kernel_pkg/${KNAME}/modules/lib/modules/${KNAME}"
             mkdir -p "${MOD_DIR}/kernel/drivers/aic8800"
             cp /tmp/aic8800_modules/*.ko "${MOD_DIR}/kernel/drivers/aic8800/" 2>/dev/null || true
             echo "AIC8800 模块已装入内核模块目录"
             # 生成模块依赖索引 (modules.alias / modules.dep)，让 modprobe 能按名字找到模块
-            depmod -b "/tmp/kernel_pkg/${KNAME}/modules" "${KVER}" 2>&1 || true
+            depmod -b "/tmp/kernel_pkg/${KNAME}/modules" "${KNAME}" 2>&1 || true
             echo "depmod 完成"
           fi
 
           cd /tmp/kernel_pkg
           tar czf "${KNAME}/boot-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/boot" .
           tar czf "${KNAME}/dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/dtb" .
-          tar czf "${KNAME}/modules-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/modules" "lib/modules/${KVER}"
+          tar czf "${KNAME}/modules-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/modules" "lib/modules/${KNAME}"
 
           cd "${KNAME}"
           sha256sum *.tar.gz > sha256sums
