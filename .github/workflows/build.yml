@@ -390,12 +390,28 @@ jobs:
       # ============================================================
       # Phase 5: 使用 ophub 打包为 N1 固件
       # ============================================================
+      - name: 预置内核到 ophub 工作目录
+        run: |
+          KNAME="${{ env.KNAME }}"
+          # 克隆 ophub 打包工具 (action 运行时检测到已存在会跳过)
+          git clone --depth 1 https://github.com/ophub/amlogic-s9xxx-openwrt.git make-openwrt
+          # 在 action 预期的路径创建内核目录 (kernel_usage=stable, version=KNAME)
+          KERNEL_DIR="make-openwrt/kernel/stable/${KNAME}"
+          mkdir -p "${KERNEL_DIR}"
+          cp "/tmp/kernel_pkg/${KNAME}/boot-${KNAME}.tar.gz" "${KERNEL_DIR}/"
+          cp "/tmp/kernel_pkg/${KNAME}/dtb-amlogic-${KNAME}.tar.gz" "${KERNEL_DIR}/"
+          cp "/tmp/kernel_pkg/${KNAME}/modules-${KNAME}.tar.gz" "${KERNEL_DIR}/"
+          cp "/tmp/kernel_pkg/${KNAME}/sha256sums" "${KERNEL_DIR}/" 2>/dev/null || true
+          echo "内核文件已预置:"
+          ls -lh "${KERNEL_DIR}/"
+
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
           openwrt_path: openwrt/bin/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz
           openwrt_board: s905d
-          kernel_local_path: /tmp/kernel_pkg
+          kernel_repo: ophub/kernel
+          kernel_usage: stable
           openwrt_kernel: ${{ env.KNAME }}
           auto_kernel: false
           openwrt_files: inject
