@@ -56,13 +56,55 @@ jobs:
           cd /tmp/linux
           echo "内核源码就绪: $(git describe --tags)"
 
-      - name: 配置内核 (meson_gxl_defconfig + WiFi/USB)
+      - name: 配置内核 (arm64 defconfig + Amlogic Meson + WiFi/USB)
         run: |
           cd /tmp/linux
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- meson_gxl_defconfig
+          # 使用通用 arm64 defconfig (meson_gxl_defconfig 在 stable 仓库中不存在)
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
 
+          # --- Amlogic Meson 平台支持 ---
+          scripts/config --enable ARCH_MESON
+          scripts/config --enable MESON_GX_SOCINFO
+          scripts/config --enable MESON_GX_PM_DOMAINS
+          scripts/config --enable MESON_EE_PM_DOMAINS
+          scripts/config --enable COMMON_CLK_GXBB
+          scripts/config --enable COMMON_CLK_AXG
+          scripts/config --enable COMMON_CLK_G12A
+          scripts/config --enable COMMON_CLK_SM1
+          scripts/config --enable MESON_GX_MMC
+          scripts/config --enable MESON_MX_SDIO
+          scripts/config --enable SERIAL_MESON
+          scripts/config --enable SERIAL_MESON_CONSOLE
+          scripts/config --enable MESON8B_WATCHDOG
+          scripts/config --enable MESON_SARADC
+          scripts/config --enable MESON_SM
+          scripts/config --enable MESON_MX_SOCINFO
+          scripts/config --enable PHY_MESON8B_USB2
+          scripts/config --enable PHY_MESON_GXL_USB2
+          scripts/config --enable PHY_MESON_G12A_USB2
+          scripts/config --enable PHY_MESON_G12A_USB3_PCIE
+          scripts/config --enable PHY_MESON_AXG_PCIE
+          scripts/config --enable DWMAC_MESON
+          scripts/config --enable STMMAC_ETH
+          scripts/config --enable STMMAC_PLATFORM
+          scripts/config --enable MESON_CAN
+          scripts/config --enable DRM_MESON
+          scripts/config --enable DRM_MESON_DW_HDMI
+          scripts/config --enable DRM_MESON_DW_MIPI_DSI
+          scripts/config --enable DRM_MESON_VPU
+          scripts/config --enable SND_SOC_MESON
+          scripts/config --enable SND_SOC_GX_SOUND_CARD
+
+          # --- WiFi 子系统 ---
           scripts/config --enable CFG80211
           scripts/config --enable MAC80211
+          scripts/config --module CFG80211
+          scripts/config --module MAC80211
+          scripts/config --module BT
+          scripts/config --module BT_BCM
+          scripts/config --module BT_HCIBTUSB
+
+          # --- USB 子系统 ---
           scripts/config --enable USB_SUPPORT
           scripts/config --enable USB
           scripts/config --enable USB_ANNOUNCE_NEW_DEVICES
@@ -70,22 +112,32 @@ jobs:
           scripts/config --enable USB_NET_RNDIS_HOST
           scripts/config --enable USB_SERIAL
           scripts/config --enable USB_STORAGE
-          scripts/config --module CFG80211
-          scripts/config --module MAC80211
-          scripts/config --module BT
-          scripts/config --module BT_BCM
-          scripts/config --module BT_HCIBTUSB
+          scripts/config --enable USB_XHCI_HCD
+          scripts/config --enable USB_EHCI_HCD
+          scripts/config --enable USB_OHCI_HCD
+
+          # --- 基础内核功能 ---
           scripts/config --enable MODULES
           scripts/config --enable KALLSYMS
           scripts/config --enable PROC_FS
           scripts/config --enable SYSFS
           scripts/config --enable DEVTMPFS
           scripts/config --enable DEVTMPFS_MOUNT
+          scripts/config --enable INITRAMFS_SOURCE
+          scripts/config --enable BLK_DEV_INITRD
+          scripts/config --enable OF
+          scripts/config --enable I2C
+          scripts/config --enable SPI
+          scripts/config --enable GPIO_SYSFS
+          scripts/config --enable PINCTRL
+          scripts/config --enable PWM
+          scripts/config --enable REGULATOR
+          scripts/config --enable THERMAL
 
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
           echo "内核配置完成"
-          grep -E "CFG80211|MAC80211|USB_SUPPORT|USB_NET" .config | head -10
+          grep -E "ARCH_MESON|CFG80211|MAC80211|USB_SUPPORT" .config | head -10
 
       - name: 编译内核 Image + DTB + 模块
         run: |
@@ -284,7 +336,10 @@ jobs:
             MOD_DIR="/tmp/kernel_pkg/${KNAME}/modules/lib/modules/${KVER}"
             mkdir -p "${MOD_DIR}/kernel/drivers/aic8800"
             cp /tmp/aic8800_modules/*.ko "${MOD_DIR}/kernel/drivers/aic8800/" 2>/dev/null || true
-            echo "AIC8800 模块已注入"
+            echo "AIC8800 模块已装入内核模块目录"
+            # 生成模块依赖索引 (modules.alias / modules.dep)，让 modprobe 能按名字找到模块
+            depmod -b "/tmp/kernel_pkg/${KNAME}/modules" "${KVER}" 2>&1 || true
+            echo "depmod 完成"
           fi
 
           cd /tmp/kernel_pkg
@@ -302,23 +357,25 @@ jobs:
           ls -lh /tmp/${KNAME}.tar.gz
           echo "KNAME=${KNAME}" >> $GITHUB_ENV
 
-      - name: 组装注入包
+      - name: 组装注入包 (固件 + 初始化脚本)
         run: |
-          KVER="${{ env.KVER }}"
           INJECT="$GITHUB_WORKSPACE/inject"
           mkdir -p "$INJECT"/etc/hotplug.d/usb "$INJECT"/etc/uci-defaults "$INJECT"/lib/firmware
 
+          # --- AIC8800 固件 (驱动加载时需要) ---
           if [ -d /tmp/aic8800/fw ]; then
             cp -r /tmp/aic8800/fw/. "$INJECT/lib/firmware/"
             echo "AIC8800 固件已注入"
           fi
 
+          # --- USB 热插拔: 仅处理模式切换，模块加载由内核自动完成 ---
           SKIP="${{ steps.build_aic8800.outputs.skip }}"
           if [ "$SKIP" != "true" ]; then
-            printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\nKVER=$(uname -r)\nMOD_DIR="/lib/modules/${KVER}/kernel/drivers/aic8800"\ncase "$PRODUCT" in\n    a69c/8d81/*|368b/8d81/*)\n      modprobe cfg80211 2>/dev/null\n      modprobe mac80211 2>/dev/null\n      insmod "${MOD_DIR}/aic_load_fw.ko" 2>/dev/null || true\n      sleep 1\n      insmod "${MOD_DIR}/aic8800_fdrv.ko" 2>/dev/null || true\n      ;;\nesac\nexit 0\n' > "$INJECT/etc/hotplug.d/usb/99-aic8800"
+            printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    a69c/8d81/*|368b/8d81/*)\n      modprobe aic_load_fw 2>/dev/null || true\n      sleep 1\n      modprobe aic8800_fdrv 2>/dev/null || true\n      ;;\nesac\nexit 0\n' > "$INJECT/etc/hotplug.d/usb/99-aic8800"
             chmod +x "$INJECT/etc/hotplug.d/usb/99-aic8800"
           fi
 
+          # --- 默认配置 ---
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' \
             > "$INJECT/etc/uci-defaults/99-set-lan-ip"
           chmod +x "$INJECT/etc/uci-defaults/99-set-lan-ip"
@@ -327,7 +384,7 @@ jobs:
             > "$INJECT/etc/uci-defaults/99-zh-cn"
           chmod +x "$INJECT/etc/uci-defaults/99-zh-cn"
 
-          echo "注入包组装完成"
+          echo "注入包组装完成 (仅固件+脚本，模块已在内核包中)"
           find "$INJECT" -type f | sort
 
       # ============================================================
