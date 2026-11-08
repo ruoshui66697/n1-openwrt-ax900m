@@ -249,42 +249,48 @@ jobs:
           git clone --depth 1 --branch ${{ github.event.inputs.driver_branch }} \
             https://github.com/shenmintao/aic8800d80.git /tmp/aic8800
 
-          find /tmp/aic8800 -name "*.c" -exec \
-            sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed/g' {} \;
-          find /tmp/aic8800 -name "*.c" -exec \
-            sed -i 's/return -1; \/\/ Unsupported chip/return 0;/g' {} \;
-
-          DRIVER_MAKE=$(find /tmp/aic8800 -maxdepth 2 -name "Makefile" -type f | head -1)
-          if [ -z "$DRIVER_MAKE" ]; then
-            echo "⚠️ 未找到 AIC8800 Makefile"
+          # 内核模块源码在 drivers/aic8800/ 子目录
+          DRIVER_DIR="/tmp/aic8800/drivers/aic8800"
+          if [ ! -f "$DRIVER_DIR/Makefile" ]; then
+            echo "⚠️ 未找到内核模块 Makefile: $DRIVER_DIR/Makefile"
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          DRIVER_DIR=$(dirname "$DRIVER_MAKE")
+          # 绕过芯片检查
+          find "$DRIVER_DIR" -name "*.c" -exec \
+            sed -i 's/AICWFDBG(LOGERROR).*chip unsupport.*/\/\/ Bypassed/g' {} \;
+          find "$DRIVER_DIR" -name "*.c" -exec \
+            sed -i 's/return -1; \/\/ Unsupported chip/return 0;/g' {} \;
+
           cd "$DRIVER_DIR"
 
-          EXTRA_SYM=""
-          [ -f "${KSRC_DIR}/Module.symvers" ] && \
-            EXTRA_SYM="KBUILD_EXTRA_SYMBOLS=${KSRC_DIR}/Module.symvers"
+          # 该 Makefile 使用 KDIR 变量指向内核构建目录
+          # CONFIG_PLATFORM_UBUNTU=y 是默认值，使用 KDIR + CROSS_COMPILE
 
-          if ! make ARCH=arm64 \
+          if ! make modules \
+            KDIR="${KSRC_DIR}" \
+            ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KVER="${KVER}" \
-            KSRC="${KSRC_DIR}" \
-            ${EXTRA_SYM} \
-            -j$(nproc) 2>&1 | tee /tmp/aic8800_build.log; then
+            CONFIG_PLATFORM_UBUNTU=y \
+            CONFIG_PLATFORM_AMLOGIC=n \
+            CONFIG_PLATFORM_ROCKCHIP=n \
+            CONFIG_PLATFORM_ALLWINNER=n \
+            CONFIG_PLATFORM_HI=n \
+            2>&1 | tee /tmp/aic8800_build.log; then
             echo "⚠️ AIC8800 编译失败，固件仍可启动但无 WiFi"
             tail -30 /tmp/aic8800_build.log
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          # 收集编译产物
           mkdir -p /tmp/aic8800_modules
-          find /tmp/aic8800 -name "*.ko" -exec cp {} /tmp/aic8800_modules/ \;
+          find "$DRIVER_DIR" -name "*.ko" -exec cp {} /tmp/aic8800_modules/ \;
 
           if [ -z "$(ls /tmp/aic8800_modules/*.ko 2>/dev/null)" ]; then
             echo "⚠️ 未找到 .ko 文件"
+            tail -20 /tmp/aic8800_build.log
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
