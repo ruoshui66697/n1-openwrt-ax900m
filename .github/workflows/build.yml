@@ -351,7 +351,7 @@ jobs:
 
           # 重组模块目录结构以匹配 ophub action 期望的路径
           # action 期望: s905d/rootfs/lib/modules/${KNAME}/
-          mkdir -p /tmp/modules_repack/s905d/rootfs
+          mkdir -p /tmp/modules_repack/s905d/rootfs/lib/modules
           cp -a "${KNAME}/modules/lib/modules/${KNAME}" /tmp/modules_repack/s905d/rootfs/lib/modules/
           tar czf "${KNAME}/modules-${KNAME}.tar.gz" --owner=0 --group=0 -C /tmp/modules_repack "s905d/rootfs/lib/modules/${KNAME}"
           rm -rf /tmp/modules_repack
