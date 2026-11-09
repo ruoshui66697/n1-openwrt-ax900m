@@ -346,24 +346,31 @@ jobs:
           fi
 
           cd /tmp/kernel_pkg
-          
+
           # ophub action 期望的内核包结构: {version}/{board}/(boot|dtb|rootfs/lib/modules/{version})
           # 为 s905d 板子重组目录结构
-          mkdir -p "${KNAME}/s905d/rootfs/lib"
+          # 注意: 必须先创建 rootfs/lib/modules，否则 mv 目标父目录不存在会失败
+          mkdir -p "${KNAME}/s905d/rootfs/lib/modules"
           mv "${KNAME}/boot" "${KNAME}/s905d/boot"
           mv "${KNAME}/dtb" "${KNAME}/s905d/dtb"
-          mv "${KNAME}/modules/lib/modules/${KNAME}" "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
+          mv "${KNAME}/modules/lib/modules/${KNAME}" \
+             "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
           rm -rf "${KNAME}/modules"
-          
+
+          # 断言重组成功
+          ls -ld "${KNAME}/s905d/boot" "${KNAME}/s905d/dtb" \
+                "${KNAME}/s905d/rootfs/lib/modules/${KNAME}" \
+            || { echo "❌ 内核包目录重组失败"; exit 1; }
+
           # 创建各部分的 tarball (用于 sha256 校验)
           tar czf "${KNAME}/boot-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/boot" .
           tar czf "${KNAME}/dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/dtb" .
           tar czf "${KNAME}/modules-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" "lib/modules/${KNAME}"
-          
+
           cd "${KNAME}"
           sha256sum *.tar.gz > sha256sums
           cd ..
-          
+
           # 打包整个内核包 (包含 s905d 板级目录结构)
           tar czf "/tmp/${KNAME}.tar.gz" --owner=0 --group=0 "${KNAME}"
 
