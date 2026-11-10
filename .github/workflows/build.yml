@@ -352,36 +352,60 @@ jobs:
 
           cd /tmp/kernel_pkg
 
-          # ★ ophub 期望模块位于 rootfs/usr/lib/modules/ 下
+          # ★ 同时满足两套路径预期：
+          #   usr/lib/modules/${KNAME}  → 真实目录（ophub replace_kernel 的安装目标）
+          #   lib/modules/${KNAME}      → 符号链接（remake 脚本第 975 行硬编码的 cd 目标）
           mkdir -p "${KNAME}/s905d/rootfs/usr/lib/modules"
-          mv "${KNAME}/boot" "${KNAME}/s905d/boot"
-          mv "${KNAME}/dtb"  "${KNAME}/s905d/dtb"
           mv "${KNAME}/modules/lib/modules/${KNAME}" \
              "${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}"
+
+          mkdir -p "${KNAME}/s905d/rootfs/lib/modules"
+          ln -s "../../usr/lib/modules/${KNAME}" \
+                "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
+
+          mv "${KNAME}/boot" "${KNAME}/s905d/boot"
+          mv "${KNAME}/dtb"  "${KNAME}/s905d/dtb"
           rm -rf "${KNAME}/modules"
 
-          DST_MOD_DIR="${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}"
-          if [ ! -d "${DST_MOD_DIR}" ]; then
-            echo "❌ 模块目录重组失败: ${DST_MOD_DIR} 不存在"
+          # ---- 验证 1: usr/lib/modules 真实目录存在且非空 ----
+          USR_MOD_DIR="${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}"
+          if [ ! -d "${USR_MOD_DIR}" ]; then
+            echo "❌ 真实模块目录不存在: ${USR_MOD_DIR}"
             exit 1
           fi
-
-          KO_COUNT=$(find "${DST_MOD_DIR}" -name "*.ko" | wc -l)
-          echo "重组后 .ko 文件数: ${KO_COUNT}"
+          KO_COUNT=$(find "${USR_MOD_DIR}" -name "*.ko" | wc -l)
+          echo "usr/lib/modules 下 .ko 文件数: ${KO_COUNT}"
           if [ "${KO_COUNT}" -eq 0 ]; then
-            echo "❌ 模块目录为空"
-            find "${DST_MOD_DIR}" -maxdepth 4 2>/dev/null | head -30 || true
+            echo "❌ 真实模块目录为空"
             exit 1
           fi
 
-          echo "===== 重组后 s905d 目录结构 ====="
-          find "${KNAME}/s905d" -maxdepth 4 -type d 2>/dev/null | head -30 || true
-          echo "===== 模块 .ko 示例 (前 10) ====="
-          find "${DST_MOD_DIR}" -name "*.ko" 2>/dev/null | head -10 || true
+          # ---- 验证 2: lib/modules 符号链接可解析，且 cd 能进入 ----
+          LIB_LINK="${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
+          if [ ! -L "${LIB_LINK}" ]; then
+            echo "❌ lib/modules 符号链接不存在: ${LIB_LINK}"
+            exit 1
+          fi
+          if ! ( cd "${LIB_LINK}" 2>/dev/null ); then
+            echo "❌ 无法通过 lib/modules 符号链接进入目录"
+            ls -la "${KNAME}/s905d/rootfs/lib/modules/" 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ lib/modules 符号链接可正常解析"
+          echo "   链接指向: $(readlink "${LIB_LINK}")"
+          echo "   真实目录: $(readlink -f "${LIB_LINK}")"
 
+          # 展示结构
+          echo "===== s905d 目录结构 ====="
+          find "${KNAME}/s905d" -maxdepth 5 -type d 2>/dev/null | head -30 || true
+          echo "===== lib/modules 下的链接 ====="
+          ls -la "${KNAME}/s905d/rootfs/lib/modules/" 2>/dev/null || true
+
+          # 创建 tarball
           tar czf "${KNAME}/boot-${KNAME}.tar.gz"        --owner=0 --group=0 -C "${KNAME}/s905d/boot" .
           tar czf "${KNAME}/dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/dtb" .
-          tar czf "${KNAME}/modules-${KNAME}.tar.gz"     --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" "usr/lib/modules/${KNAME}"
+          tar czf "${KNAME}/modules-${KNAME}.tar.gz"     --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" \
+            "usr/lib/modules/${KNAME}" "lib/modules/${KNAME}"
 
           cd "${KNAME}"
           sha256sum *.tar.gz > sha256sums
@@ -389,21 +413,20 @@ jobs:
 
           tar czf "/tmp/${KNAME}.tar.gz" --owner=0 --group=0 "${KNAME}"
 
-          # ★ 关键验证：tar 列表先落地文件，再 grep，避免 SIGPIPE
+          # ★ tar 包内路径验证（两套路径都必须存在）
           echo "===== tar 包内部结构验证 ====="
           tar -tzf "/tmp/${KNAME}.tar.gz" > /tmp/kernel_tarlist.txt 2>/dev/null
+
           if ! grep -q "^${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/" /tmp/kernel_tarlist.txt; then
-            echo "❌ tar 包中缺少 ${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/ 路径"
-            grep 's905d' /tmp/kernel_tarlist.txt | head -30 || true
+            echo "❌ tar 包缺少 usr/lib/modules/${KNAME}/ 路径"
             exit 1
           fi
-          echo "✅ tar 包含 s905d/rootfs/usr/lib/modules/${KNAME}/ 路径"
-          echo "--- 模块示例 (前 5) ---"
-          grep "^${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/" /tmp/kernel_tarlist.txt | head -5 || true
-          echo "--- boot 示例 (前 5) ---"
-          grep "^${KNAME}/s905d/boot/" /tmp/kernel_tarlist.txt | head -5 || true
-          echo "--- dtb 示例 (前 5) ---"
-          grep "^${KNAME}/s905d/dtb/" /tmp/kernel_tarlist.txt | head -5 || true
+          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}$" /tmp/kernel_tarlist.txt; then
+            echo "❌ tar 包缺少 lib/modules/${KNAME} 符号链接条目"
+            grep 'lib/modules' /tmp/kernel_tarlist.txt | head -10 || true
+            exit 1
+          fi
+          echo "✅ tar 包同时包含 usr/lib/modules 真实目录与 lib/modules 符号链接"
 
           echo "内核包打包完成:"
           ls -lh /tmp/${KNAME}.tar.gz
@@ -433,7 +456,7 @@ jobs:
             > "$INJECT/etc/uci-defaults/99-zh-cn"
           chmod +x "$INJECT/etc/uci-defaults/99-zh-cn"
 
-          echo "注入包组装完成 (仅固件+脚本，模块已在内核包中)"
+          echo "注入包组装完成"
           find "$INJECT" -type f | sort
 
       # ============================================================
@@ -468,16 +491,13 @@ jobs:
             --title "Kernel ${KNAME}" \
             --notes "Self-compiled kernel ${KNAME} for Amlogic S905D (N1)"
 
-          echo "验证 release..."
-          gh release view "${TAG}" --repo "${REPO}"
-
           ASSET_NAME=$(basename "${ASSET}")
           gh release view "${TAG}" --repo "${REPO}" --json assets --jq ".assets[].name" \
             | grep -q "${ASSET_NAME}" || {
             echo "❌ 内核文件未成功上传到 release"
             exit 1
           }
-          echo "✅ 内核已上传到 ${REPO} release ${TAG}"
+          echo "✅ 内核已上传到 release ${TAG}"
 
           echo "等待 GitHub 传播 (10 秒)..."
           sleep 10
@@ -486,14 +506,18 @@ jobs:
           gh release download "${TAG}" --repo "${REPO}" \
             --pattern "${KNAME}.tar.gz" --dir /tmp/verify --clobber
 
-          echo "===== 验证 Release 资产结构 (usr/lib/modules) ====="
+          echo "===== 验证 Release 资产结构 ====="
           tar -tzf "/tmp/verify/${KNAME}.tar.gz" > /tmp/release_tarlist.txt 2>/dev/null
+
           if ! grep -q "^${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/" /tmp/release_tarlist.txt; then
-            echo "❌ Release 资产中缺少 s905d/rootfs/usr/lib/modules/${KNAME}/ 路径"
-            grep 's905d' /tmp/release_tarlist.txt | head -30 || true
+            echo "❌ Release 资产缺少 usr/lib/modules 真实目录"
             exit 1
           fi
-          echo "✅ Release 资产验证通过（含 usr/lib/modules 路径）"
+          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}$" /tmp/release_tarlist.txt; then
+            echo "❌ Release 资产缺少 lib/modules 符号链接"
+            exit 1
+          fi
+          echo "✅ Release 资产同时包含 usr/lib/modules 与 lib/modules 链接"
 
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
