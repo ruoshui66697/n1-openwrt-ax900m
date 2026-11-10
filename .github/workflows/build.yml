@@ -352,21 +352,20 @@ jobs:
 
           cd /tmp/kernel_pkg
 
-          # ophub 期望: {version}/{board}/(boot|dtb|rootfs/lib/modules/{version})
-          mkdir -p "${KNAME}/s905d/rootfs/lib/modules"
+          # ★ ophub 期望模块位于 rootfs/usr/lib/modules/ 下
+          mkdir -p "${KNAME}/s905d/rootfs/usr/lib/modules"
           mv "${KNAME}/boot" "${KNAME}/s905d/boot"
           mv "${KNAME}/dtb"  "${KNAME}/s905d/dtb"
           mv "${KNAME}/modules/lib/modules/${KNAME}" \
-             "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
+             "${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}"
           rm -rf "${KNAME}/modules"
 
-          DST_MOD_DIR="${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
+          DST_MOD_DIR="${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}"
           if [ ! -d "${DST_MOD_DIR}" ]; then
             echo "❌ 模块目录重组失败: ${DST_MOD_DIR} 不存在"
             exit 1
           fi
 
-          # 统计 .ko 数量（wc 读完所有输入，不会 SIGPIPE）
           KO_COUNT=$(find "${DST_MOD_DIR}" -name "*.ko" | wc -l)
           echo "重组后 .ko 文件数: ${KO_COUNT}"
           if [ "${KO_COUNT}" -eq 0 ]; then
@@ -375,16 +374,14 @@ jobs:
             exit 1
           fi
 
-          # ★ 展示类命令加 || true，避免 pipefail + SIGPIPE 误杀
           echo "===== 重组后 s905d 目录结构 ====="
           find "${KNAME}/s905d" -maxdepth 4 -type d 2>/dev/null | head -30 || true
           echo "===== 模块 .ko 示例 (前 10) ====="
           find "${DST_MOD_DIR}" -name "*.ko" 2>/dev/null | head -10 || true
 
-          # 创建各部分 tarball
           tar czf "${KNAME}/boot-${KNAME}.tar.gz"        --owner=0 --group=0 -C "${KNAME}/s905d/boot" .
           tar czf "${KNAME}/dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/dtb" .
-          tar czf "${KNAME}/modules-${KNAME}.tar.gz"     --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" "lib/modules/${KNAME}"
+          tar czf "${KNAME}/modules-${KNAME}.tar.gz"     --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" "usr/lib/modules/${KNAME}"
 
           cd "${KNAME}"
           sha256sum *.tar.gz > sha256sums
@@ -392,18 +389,17 @@ jobs:
 
           tar czf "/tmp/${KNAME}.tar.gz" --owner=0 --group=0 "${KNAME}"
 
-          # ★ 关键验证: tar 列表先落地文件，再 grep，彻底避免 SIGPIPE
+          # ★ 关键验证：tar 列表先落地文件，再 grep，避免 SIGPIPE
           echo "===== tar 包内部结构验证 ====="
           tar -tzf "/tmp/${KNAME}.tar.gz" > /tmp/kernel_tarlist.txt 2>/dev/null
-          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" /tmp/kernel_tarlist.txt; then
-            echo "❌ tar 包中缺少 ${KNAME}/s905d/rootfs/lib/modules/${KNAME}/ 路径"
-            echo "--- tar 包内所有包含 s905d 的条目 ---"
+          if ! grep -q "^${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/" /tmp/kernel_tarlist.txt; then
+            echo "❌ tar 包中缺少 ${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/ 路径"
             grep 's905d' /tmp/kernel_tarlist.txt | head -30 || true
             exit 1
           fi
-          echo "✅ tar 包含 s905d/rootfs/lib/modules/${KNAME}/ 路径"
+          echo "✅ tar 包含 s905d/rootfs/usr/lib/modules/${KNAME}/ 路径"
           echo "--- 模块示例 (前 5) ---"
-          grep "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" /tmp/kernel_tarlist.txt | head -5 || true
+          grep "^${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/" /tmp/kernel_tarlist.txt | head -5 || true
           echo "--- boot 示例 (前 5) ---"
           grep "^${KNAME}/s905d/boot/" /tmp/kernel_tarlist.txt | head -5 || true
           echo "--- dtb 示例 (前 5) ---"
@@ -449,7 +445,6 @@ jobs:
         run: |
           set -euo pipefail
           KNAME="${{ env.KNAME }}"
-          # ★ ophub 在 kernel_usage=stable 时下载标签就是 kernel_stable
           TAG="kernel_stable"
           ASSET="/tmp/${KNAME}.tar.gz"
           REPO="${{ github.repository }}"
@@ -460,7 +455,6 @@ jobs:
           fi
           echo "内核文件: ${ASSET} ($(du -h "${ASSET}" | cut -f1))"
 
-          # 彻底清理旧 release（kernel_stable 与 stable 都清）
           for OLD_TAG in "kernel_stable" "stable"; do
             if gh release view "${OLD_TAG}" --repo "${REPO}" >/dev/null 2>&1; then
               echo "清理旧 release: ${OLD_TAG}"
@@ -485,7 +479,6 @@ jobs:
           }
           echo "✅ 内核已上传到 ${REPO} release ${TAG}"
 
-          # ★ 下载回来二次验证结构，彻底排除「拿到旧坏包」
           echo "等待 GitHub 传播 (10 秒)..."
           sleep 10
 
@@ -493,14 +486,14 @@ jobs:
           gh release download "${TAG}" --repo "${REPO}" \
             --pattern "${KNAME}.tar.gz" --dir /tmp/verify --clobber
 
-          echo "===== 验证 Release 资产结构 ====="
+          echo "===== 验证 Release 资产结构 (usr/lib/modules) ====="
           tar -tzf "/tmp/verify/${KNAME}.tar.gz" > /tmp/release_tarlist.txt 2>/dev/null
-          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" /tmp/release_tarlist.txt; then
-            echo "❌ Release 资产中缺少 s905d/rootfs/lib/modules/${KNAME}/ 路径"
+          if ! grep -q "^${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}/" /tmp/release_tarlist.txt; then
+            echo "❌ Release 资产中缺少 s905d/rootfs/usr/lib/modules/${KNAME}/ 路径"
             grep 's905d' /tmp/release_tarlist.txt | head -30 || true
             exit 1
           fi
-          echo "✅ Release 资产验证通过（含模块路径）"
+          echo "✅ Release 资产验证通过（含 usr/lib/modules 路径）"
 
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
