@@ -348,11 +348,10 @@ jobs:
           cd /tmp/kernel_pkg
 
           # ophub action 期望的内核包结构: {version}/{board}/(boot|dtb|rootfs/lib/modules/{version})
-          # 为 s905d 板子重组目录结构
           # 注意: 必须先创建 rootfs/lib/modules，否则 mv 目标父目录不存在会失败
           mkdir -p "${KNAME}/s905d/rootfs/lib/modules"
           mv "${KNAME}/boot" "${KNAME}/s905d/boot"
-          mv "${KNAME}/dtb" "${KNAME}/s905d/dtb"
+          mv "${KNAME}/dtb"  "${KNAME}/s905d/dtb"
           mv "${KNAME}/modules/lib/modules/${KNAME}" \
              "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
           rm -rf "${KNAME}/modules"
@@ -363,9 +362,9 @@ jobs:
             || { echo "❌ 内核包目录重组失败"; exit 1; }
 
           # 创建各部分的 tarball (用于 sha256 校验)
-          tar czf "${KNAME}/boot-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/boot" .
+          tar czf "${KNAME}/boot-${KNAME}.tar.gz"        --owner=0 --group=0 -C "${KNAME}/s905d/boot" .
           tar czf "${KNAME}/dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/dtb" .
-          tar czf "${KNAME}/modules-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" "lib/modules/${KNAME}"
+          tar czf "${KNAME}/modules-${KNAME}.tar.gz"     --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" "lib/modules/${KNAME}"
 
           cd "${KNAME}"
           sha256sum *.tar.gz > sha256sums
@@ -373,6 +372,26 @@ jobs:
 
           # 打包整个内核包 (包含 s905d 板级目录结构)
           tar czf "/tmp/${KNAME}.tar.gz" --owner=0 --group=0 "${KNAME}"
+
+          # ★ 关键验证: 确保 tar 包内包含 ophub 期望的模块路径
+          echo "===== 验证 tar 包内部结构 ====="
+          echo "--- 顶层目录 ---"
+          tar -tzf "/tmp/${KNAME}.tar.gz" | awk -F/ '{print $1"/"$2"/"$3}' | sort -u | head -20
+          echo "--- s905d 关键路径 ---"
+          if ! tar -tzf "/tmp/${KNAME}.tar.gz" | grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/"; then
+            echo "❌ tar 包中缺少 ${KNAME}/s905d/rootfs/lib/modules/${KNAME}/ 路径"
+            echo "--- tar 包内所有包含 s905d 的条目 ---"
+            tar -tzf "/tmp/${KNAME}.tar.gz" | grep 's905d' | head -30
+            exit 1
+          fi
+          echo "✅ tar 包含 rootfs/lib/modules/${KNAME}/ 路径"
+          echo "--- 模块示例 (前 5 个) ---"
+          tar -tzf "/tmp/${KNAME}.tar.gz" | grep "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" | head -5
+          echo "--- boot 示例 (前 5 个) ---"
+          tar -tzf "/tmp/${KNAME}.tar.gz" | grep "^${KNAME}/s905d/boot/" | head -5
+          echo "--- dtb 示例 (前 5 个) ---"
+          tar -tzf "/tmp/${KNAME}.tar.gz" | grep "^${KNAME}/s905d/dtb/" | head -5
+          echo "===== tar 包验证通过 ====="
 
           echo "内核包打包完成:"
           ls -lh /tmp/${KNAME}.tar.gz
@@ -417,7 +436,8 @@ jobs:
         run: |
           set -euo pipefail
           KNAME="${{ env.KNAME }}"
-          TAG="kernel_stable"
+          # ★ 关键: TAG 必须与 ophub action 的 kernel_usage 保持一致
+          TAG="stable"
           ASSET="/tmp/${KNAME}.tar.gz"
           REPO="${{ github.repository }}"
 
@@ -427,14 +447,16 @@ jobs:
           fi
           echo "内核文件: ${ASSET} ($(du -h "${ASSET}" | cut -f1))"
 
-          # 删除旧 release (如果存在)
-          echo "清理旧 release..."
-          gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1 && \
-            gh release delete "${TAG}" --cleanup-tag --yes --repo "${REPO}" || \
-            echo "旧 release 不存在，跳过删除"
+          # 删除旧 release (如果存在) —— 包含之前的 kernel_stable 遗留
+          for OLD_TAG in "${TAG}" "kernel_stable"; do
+            if gh release view "${OLD_TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+              echo "清理旧 release: ${OLD_TAG}"
+              gh release delete "${OLD_TAG}" --cleanup-tag --yes --repo "${REPO}" || true
+            fi
+          done
 
           # 创建新 release 并上传
-          echo "创建 release 并上传内核..."
+          echo "创建 release ${TAG} 并上传内核..."
           gh release create "${TAG}" "${ASSET}" \
             --repo "${REPO}" \
             --title "Kernel ${KNAME}" \
