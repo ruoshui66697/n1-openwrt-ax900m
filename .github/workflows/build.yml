@@ -59,7 +59,6 @@ jobs:
       - name: 配置内核 (arm64 defconfig + Amlogic Meson + WiFi/USB)
         run: |
           cd /tmp/linux
-          # 使用通用 arm64 defconfig (meson_gxl_defconfig 在 stable 仓库中不存在)
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
 
           # --- Amlogic Meson 平台支持 ---
@@ -134,7 +133,6 @@ jobs:
           scripts/config --enable REGULATOR
           scripts/config --enable THERMAL
 
-          # 设置内核本地版本后缀，让模块目录名与 KNAME 匹配
           scripts/config --set-str LOCALVERSION "-self"
 
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
@@ -301,6 +299,7 @@ jobs:
       # ============================================================
       - name: 打包内核为 ophub 格式
         run: |
+          set -euo pipefail
           KVER="${{ env.KVER }}"
           KNAME="${KVER}-self"
 
@@ -334,21 +333,27 @@ jobs:
           find /tmp/kernel_pkg/${KNAME}/modules -type l -name "build" -delete 2>/dev/null || true
           find /tmp/kernel_pkg/${KNAME}/modules -type l -name "source" -delete 2>/dev/null || true
 
+          # 确认 modules_install 之后的源目录
+          SRC_MOD_DIR="/tmp/kernel_pkg/${KNAME}/modules/lib/modules/${KNAME}"
+          if [ ! -d "${SRC_MOD_DIR}" ]; then
+            echo "❌ modules_install 未生成 ${SRC_MOD_DIR}"
+            find /tmp/kernel_pkg/${KNAME}/modules -maxdepth 4 -type d | head -20
+            exit 1
+          fi
+
           SKIP="${{ steps.build_aic8800.outputs.skip }}"
           if [ "$SKIP" != "true" ] && [ -d /tmp/aic8800_modules ]; then
-            MOD_DIR="/tmp/kernel_pkg/${KNAME}/modules/lib/modules/${KNAME}"
+            MOD_DIR="${SRC_MOD_DIR}"
             mkdir -p "${MOD_DIR}/kernel/drivers/aic8800"
             cp /tmp/aic8800_modules/*.ko "${MOD_DIR}/kernel/drivers/aic8800/" 2>/dev/null || true
             echo "AIC8800 模块已装入内核模块目录"
-            # 生成模块依赖索引 (modules.alias / modules.dep)，让 modprobe 能按名字找到模块
             depmod -b "/tmp/kernel_pkg/${KNAME}/modules" "${KNAME}" 2>&1 || true
             echo "depmod 完成"
           fi
 
           cd /tmp/kernel_pkg
 
-          # ophub action 期望的内核包结构: {version}/{board}/(boot|dtb|rootfs/lib/modules/{version})
-          # 注意: 必须先创建 rootfs/lib/modules，否则 mv 目标父目录不存在会失败
+          # ophub 期望: {version}/{board}/(boot|dtb|rootfs/lib/modules/{version})
           mkdir -p "${KNAME}/s905d/rootfs/lib/modules"
           mv "${KNAME}/boot" "${KNAME}/s905d/boot"
           mv "${KNAME}/dtb"  "${KNAME}/s905d/dtb"
@@ -356,12 +361,26 @@ jobs:
              "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
           rm -rf "${KNAME}/modules"
 
-          # 断言重组成功
-          ls -ld "${KNAME}/s905d/boot" "${KNAME}/s905d/dtb" \
-                "${KNAME}/s905d/rootfs/lib/modules/${KNAME}" \
-            || { echo "❌ 内核包目录重组失败"; exit 1; }
+          DST_MOD_DIR="${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
+          if [ ! -d "${DST_MOD_DIR}" ]; then
+            echo "❌ 模块目录重组失败: ${DST_MOD_DIR} 不存在"
+            exit 1
+          fi
 
-          # 创建各部分的 tarball (用于 sha256 校验)
+          KO_COUNT=$(find "${DST_MOD_DIR}" -name "*.ko" | wc -l)
+          echo "重组后 .ko 文件数: ${KO_COUNT}"
+          if [ "${KO_COUNT}" -eq 0 ]; then
+            echo "❌ 模块目录为空"
+            find "${DST_MOD_DIR}" -maxdepth 4 | head -30
+            exit 1
+          fi
+
+          echo "===== 重组后 s905d 目录结构 ====="
+          find "${KNAME}/s905d" -maxdepth 4 -type d | head -30
+          echo "===== 模块 .ko 示例 ====="
+          find "${DST_MOD_DIR}" -name "*.ko" | head -10
+
+          # 创建各部分 tarball
           tar czf "${KNAME}/boot-${KNAME}.tar.gz"        --owner=0 --group=0 -C "${KNAME}/s905d/boot" .
           tar czf "${KNAME}/dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/dtb" .
           tar czf "${KNAME}/modules-${KNAME}.tar.gz"     --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" "lib/modules/${KNAME}"
@@ -370,28 +389,23 @@ jobs:
           sha256sum *.tar.gz > sha256sums
           cd ..
 
-          # 打包整个内核包 (包含 s905d 板级目录结构)
           tar czf "/tmp/${KNAME}.tar.gz" --owner=0 --group=0 "${KNAME}"
 
-          # ★ 关键验证: 确保 tar 包内包含 ophub 期望的模块路径
-          echo "===== 验证 tar 包内部结构 ====="
-          echo "--- 顶层目录 ---"
-          tar -tzf "/tmp/${KNAME}.tar.gz" | awk -F/ '{print $1"/"$2"/"$3}' | sort -u | head -20
-          echo "--- s905d 关键路径 ---"
+          # ★ 关键验证：tar 包内必须包含模块路径
+          echo "===== tar 包内部结构验证 ====="
           if ! tar -tzf "/tmp/${KNAME}.tar.gz" | grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/"; then
             echo "❌ tar 包中缺少 ${KNAME}/s905d/rootfs/lib/modules/${KNAME}/ 路径"
             echo "--- tar 包内所有包含 s905d 的条目 ---"
             tar -tzf "/tmp/${KNAME}.tar.gz" | grep 's905d' | head -30
             exit 1
           fi
-          echo "✅ tar 包含 rootfs/lib/modules/${KNAME}/ 路径"
+          echo "✅ tar 包含 s905d/rootfs/lib/modules/${KNAME}/ 路径"
           echo "--- 模块示例 (前 5 个) ---"
           tar -tzf "/tmp/${KNAME}.tar.gz" | grep "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" | head -5
           echo "--- boot 示例 (前 5 个) ---"
           tar -tzf "/tmp/${KNAME}.tar.gz" | grep "^${KNAME}/s905d/boot/" | head -5
           echo "--- dtb 示例 (前 5 个) ---"
           tar -tzf "/tmp/${KNAME}.tar.gz" | grep "^${KNAME}/s905d/dtb/" | head -5
-          echo "===== tar 包验证通过 ====="
 
           echo "内核包打包完成:"
           ls -lh /tmp/${KNAME}.tar.gz
@@ -402,20 +416,17 @@ jobs:
           INJECT="$GITHUB_WORKSPACE/inject"
           mkdir -p "$INJECT"/etc/hotplug.d/usb "$INJECT"/etc/uci-defaults "$INJECT"/lib/firmware
 
-          # --- AIC8800 固件 (驱动加载时需要) ---
           if [ -d /tmp/aic8800/fw ]; then
             cp -r /tmp/aic8800/fw/. "$INJECT/lib/firmware/"
             echo "AIC8800 固件已注入"
           fi
 
-          # --- USB 热插拔: 仅处理模式切换，模块加载由内核自动完成 ---
           SKIP="${{ steps.build_aic8800.outputs.skip }}"
           if [ "$SKIP" != "true" ]; then
             printf '#!/bin/sh\n[ "$ACTION" = "add" ] || exit 0\ncase "$PRODUCT" in\n    a69c/8d81/*|368b/8d81/*)\n      modprobe aic_load_fw 2>/dev/null || true\n      sleep 1\n      modprobe aic8800_fdrv 2>/dev/null || true\n      ;;\nesac\nexit 0\n' > "$INJECT/etc/hotplug.d/usb/99-aic8800"
             chmod +x "$INJECT/etc/hotplug.d/usb/99-aic8800"
           fi
 
-          # --- 默认配置 ---
           printf '#!/bin/sh\nuci set network.lan.ipaddr="192.168.10.1"\nuci commit network\nexit 0\n' \
             > "$INJECT/etc/uci-defaults/99-set-lan-ip"
           chmod +x "$INJECT/etc/uci-defaults/99-set-lan-ip"
@@ -436,8 +447,8 @@ jobs:
         run: |
           set -euo pipefail
           KNAME="${{ env.KNAME }}"
-          # ★ 关键: TAG 必须与 ophub action 的 kernel_usage 保持一致
-          TAG="stable"
+          # ★ 关键: ophub 在 kernel_usage=stable 时下载的标签是 kernel_stable
+          TAG="kernel_stable"
           ASSET="/tmp/${KNAME}.tar.gz"
           REPO="${{ github.repository }}"
 
@@ -447,33 +458,44 @@ jobs:
           fi
           echo "内核文件: ${ASSET} ($(du -h "${ASSET}" | cut -f1))"
 
-          # 删除旧 release (如果存在) —— 包含之前的 kernel_stable 遗留
-          for OLD_TAG in "${TAG}" "kernel_stable"; do
+          # 彻底清理旧 release（stable 与 kernel_stable 都清，避免旧坏包残留）
+          for OLD_TAG in "kernel_stable" "stable"; do
             if gh release view "${OLD_TAG}" --repo "${REPO}" >/dev/null 2>&1; then
               echo "清理旧 release: ${OLD_TAG}"
               gh release delete "${OLD_TAG}" --cleanup-tag --yes --repo "${REPO}" || true
             fi
           done
 
-          # 创建新 release 并上传
           echo "创建 release ${TAG} 并上传内核..."
           gh release create "${TAG}" "${ASSET}" \
             --repo "${REPO}" \
             --title "Kernel ${KNAME}" \
             --notes "Self-compiled kernel ${KNAME} for Amlogic S905D (N1)"
 
-          # 验证 release 已创建且包含内核文件
           echo "验证 release..."
           gh release view "${TAG}" --repo "${REPO}"
-          echo "检查资产..."
+
           ASSET_NAME=$(basename "${ASSET}")
           gh release view "${TAG}" --repo "${REPO}" --json assets --jq ".assets[].name" | grep -q "${ASSET_NAME}" || {
             echo "❌ 内核文件未成功上传到 release"
             exit 1
           }
           echo "✅ 内核已上传到 ${REPO} release ${TAG}"
+
+          # ★ 关键验证：下载刚上传的资产，确认结构正确（防止上传到错误 tag 或旧缓存）
           echo "等待 GitHub 传播 (10 秒)..."
           sleep 10
+
+          rm -rf /tmp/verify && mkdir -p /tmp/verify
+          gh release download "${TAG}" --repo "${REPO}" \
+            --pattern "${KNAME}.tar.gz" --dir /tmp/verify --clobber
+          echo "===== 验证 Release 资产结构 ====="
+          tar -tzf "/tmp/verify/${KNAME}.tar.gz" | grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" || {
+            echo "❌ Release 资产中缺少 s905d/rootfs/lib/modules/${KNAME}/ 路径"
+            tar -tzf "/tmp/verify/${KNAME}.tar.gz" | grep 's905d' | head -30
+            exit 1
+          }
+          echo "✅ Release 资产验证通过（含模块路径）"
 
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
