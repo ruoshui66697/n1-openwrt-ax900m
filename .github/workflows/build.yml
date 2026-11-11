@@ -300,27 +300,98 @@ jobs:
           echo "✅ 注入文件已合并到 rootfs"
 
       # ============================================================
-      # Phase 4: 打包内核为 3 个独立子 tar + sha256sums + 整体包
+      # Phase 4: 打包内核子包 + 整体包
       # ============================================================
-      - name: 打包内核子包
+      - name: 打包内核子包 + 整体包
         run: |
-          # ... （之前的子包打包代码保持不变，直到 sha256sums 生成） ...
+          set -euo pipefail
+          KVER="${{ env.KVER }}"
+          KNAME="${KVER}-self"
+          echo "KNAME=${KNAME}" >> $GITHUB_ENV
 
-          sha256sum boot-*.tar.gz dtb-amlogic-*.tar.gz modules-*.tar.gz > sha256sums
+          PKG=/tmp/kernel_pkg
+          SUBDIR="$PKG/$KNAME"
+          rm -rf "$PKG"
+          mkdir -p "$SUBDIR"/{boot,dtb}
+
+          # ---- boot/ ----
+          cp /tmp/linux/arch/arm64/boot/Image  "$SUBDIR/boot/vmlinuz-${KNAME}"
+          cp /tmp/linux/.config                "$SUBDIR/boot/config-${KNAME}"
+          cp /tmp/linux/System.map             "$SUBDIR/boot/System.map-${KNAME}"
+          echo | cpio -o -H newc 2>/dev/null | gzip -9 > /tmp/initrd.gz
+          mkimage -A arm64 -O linux -T ramdisk -C gzip \
+            -d /tmp/initrd.gz "$SUBDIR/boot/uInitrd-${KNAME}"
+
+          # ---- dtb/ ----
+          cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxl-*.dtb "$SUBDIR/dtb/" 2>/dev/null || true
+          cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxm-*.dtb "$SUBDIR/dtb/" 2>/dev/null || true
+          test -f "$SUBDIR/dtb/meson-gxl-s905d-phicomm-n1.dtb" || {
+            echo "❌ 缺少 N1 DTB"; exit 1
+          }
+
+          # ---- modules/ ----
+          MOD_STAGING=/tmp/kernel_mods
+          rm -rf "$MOD_STAGING"
+          mkdir -p "$MOD_STAGING"
+          cd /tmp/linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$MOD_STAGING" modules_install 2>&1 | tail -5
+          rm -f "$MOD_STAGING/lib/modules/${KNAME}/build"
+          rm -f "$MOD_STAGING/lib/modules/${KNAME}/source"
+
+          SKIP="${{ steps.build_aic8800.outputs.skip }}"
+          if [ "$SKIP" != "true" ] && [ -d /tmp/aic8800_modules ]; then
+            MOD_DIR="$MOD_STAGING/lib/modules/${KNAME}"
+            mkdir -p "$MOD_DIR/kernel/drivers/aic8800"
+            cp /tmp/aic8800_modules/*.ko "$MOD_DIR/kernel/drivers/aic8800/"
+          fi
+          depmod -b "$MOD_STAGING" "${KNAME}"
+
+          # 双路径：usr/lib/modules 用硬链接（省空间）
+          mkdir -p "$MOD_STAGING/usr/lib/modules"
+          cp -al "$MOD_STAGING/lib/modules/${KNAME}" \
+                 "$MOD_STAGING/usr/lib/modules/${KNAME}"
+
+          for MOD_DIR in \
+            "$MOD_STAGING/lib/modules/${KNAME}" \
+            "$MOD_STAGING/usr/lib/modules/${KNAME}"; do
+            KO_COUNT=$(find "$MOD_DIR" -name "*.ko" | wc -l)
+            [ "${KO_COUNT}" -gt 0 ] || { echo "❌ 模块目录为空: ${MOD_DIR}"; exit 1; }
+          done
+
+          # ---- 打包 3 个子 tar（明确文件名 + 绝对路径）----
+          BOOT_TGZ="$SUBDIR/boot-${KNAME}.tar.gz"
+          DTB_TGZ="$SUBDIR/dtb-amlogic-${KNAME}.tar.gz"
+          MOD_TGZ="$SUBDIR/modules-${KNAME}.tar.gz"
+
+          tar czf "$BOOT_TGZ" --owner=0 --group=0 -C "$SUBDIR/boot" .
+          tar czf "$DTB_TGZ"  --owner=0 --group=0 -C "$SUBDIR/dtb"  .
+          tar czf "$MOD_TGZ"  --owner=0 --group=0 \
+            -C "$MOD_STAGING" \
+            "lib/modules/${KNAME}" "usr/lib/modules/${KNAME}"
+
+          # ---- sha256sums（明确文件名，不用通配符）----
+          (
+            cd "$SUBDIR"
+            sha256sum \
+              "boot-${KNAME}.tar.gz" \
+              "dtb-amlogic-${KNAME}.tar.gz" \
+              "modules-${KNAME}.tar.gz" > sha256sums
+          )
+
           echo "✅ 内核子包打包完成"
-          ls -lh boot-*.tar.gz dtb-amlogic-*.tar.gz modules-*.tar.gz sha256sums
+          ls -lh "$BOOT_TGZ" "$DTB_TGZ" "$MOD_TGZ" "$SUBDIR/sha256sums"
 
-          # ---- 新增：打包整体内核包（供 flippy-openwrt-actions 使用）----
-          cd "$PKG/$KNAME"
-          tar czf "/tmp/${KNAME}.tar.gz" \
-            --owner=0 --group=0 \
+          # ---- 整体包（flippy-openwrt-actions 按固定文件名下载此文件）----
+          OVERALL="/tmp/${KNAME}.tar.gz"
+          tar czf "$OVERALL" --owner=0 --group=0 -C "$SUBDIR" \
             "boot-${KNAME}.tar.gz" \
             "dtb-amlogic-${KNAME}.tar.gz" \
             "modules-${KNAME}.tar.gz" \
             "sha256sums"
 
-          echo "✅ 整体内核包已生成: /tmp/${KNAME}.tar.gz"
-          ls -lh "/tmp/${KNAME}.tar.gz"
+          echo "✅ 整体内核包: $OVERALL"
+          ls -lh "$OVERALL"
 
       # ============================================================
       # Phase 5: 上传子包 + 整体包到 Release
@@ -334,25 +405,60 @@ jobs:
           TAG="${{ env.KERNEL_RELEASE_TAG }}"
           REPO="${{ github.repository }}"
           SUBDIR="/tmp/kernel_pkg/${KNAME}"
+          OVERALL="/tmp/${KNAME}.tar.gz"
 
+          # 上传前文件存在性断言（提前暴露问题）
+          for f in \
+            "$OVERALL" \
+            "$SUBDIR/boot-${KNAME}.tar.gz" \
+            "$SUBDIR/dtb-amlogic-${KNAME}.tar.gz" \
+            "$SUBDIR/modules-${KNAME}.tar.gz" \
+            "$SUBDIR/sha256sums"; do
+            if [ ! -f "$f" ]; then
+              echo "❌ 缺少上传文件: $f"
+              ls -la "$SUBDIR" || true
+              ls -la /tmp/${KNAME}.tar.gz || true
+              exit 1
+            fi
+          done
+          echo "✅ 所有待上传文件存在"
+
+          # 清理旧 release（避免残留坏包）
           for OLD_TAG in "kernel_stable" "stable"; do
             if gh release view "${OLD_TAG}" --repo "${REPO}" >/dev/null 2>&1; then
               gh release delete "${OLD_TAG}" --cleanup-tag --yes --repo "${REPO}" || true
             fi
           done
 
-          # 同时上传整体包和子包
+          # 上传：整体包 + 3 个子包 + sha256sums
           gh release create "${TAG}" \
-            "/tmp/${KNAME}.tar.gz" \
-            "${SUBDIR}/boot-${KNAME}.tar.gz" \
-            "${SUBDIR}/dtb-amlogic-${KNAME}.tar.gz" \
-            "${SUBDIR}/modules-${KNAME}.tar.gz" \
-            "${SUBDIR}/sha256sums" \
+            "$OVERALL" \
+            "$SUBDIR/boot-${KNAME}.tar.gz" \
+            "$SUBDIR/dtb-amlogic-${KNAME}.tar.gz" \
+            "$SUBDIR/modules-${KNAME}.tar.gz" \
+            "$SUBDIR/sha256sums" \
             --repo "${REPO}" \
             --title "Kernel ${KNAME}" \
             --notes "Self-compiled kernel ${KNAME} for Amlogic S905D (N1)"
 
-          echo "✅ 内核包已上传到 release ${TAG}"
+          # 上传后校验资产
+          echo "===== 验证 release 资产 ====="
+          gh release view "${TAG}" --repo "${REPO}" --json assets --jq ".assets[].name"
+
+          echo "等待 GitHub 传播 (10 秒)..."
+          sleep 10
+
+          # 下载整体包并校验能被 unifreq/openwrt_packit 正确解包
+          rm -rf /tmp/verify && mkdir -p /tmp/verify
+          gh release download "${TAG}" --repo "${REPO}" \
+            --pattern "${KNAME}.tar.gz" --dir /tmp/verify --clobber
+
+          tar -tzf "/tmp/verify/${KNAME}.tar.gz" > /tmp/overall_tarlist.txt 2>/dev/null
+          grep -q "^boot-${KNAME}.tar.gz$"        /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 boot";   exit 1; }
+          grep -q "^dtb-amlogic-${KNAME}.tar.gz$" /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 dtb";    exit 1; }
+          grep -q "^modules-${KNAME}.tar.gz$"     /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 modules"; exit 1; }
+          grep -q "^sha256sums$"                  /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 sha256sums"; exit 1; }
+          echo "✅ Release 资产与整体包结构验证通过"
 
       # ============================================================
       # Phase 6: 打包固件
