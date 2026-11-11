@@ -461,7 +461,38 @@ jobs:
           echo "✅ Release 资产与整体包结构验证通过"
 
       # ============================================================
-      # Phase 6: 打包固件（换回 amlogic-s9xxx-openwrt）
+      # Phase 5.5: 临时包装 cp 以绕过 ophub action 的 --update 兼容性问题
+      # ============================================================
+      - name: 包装 cp（绕过 --update 参数兼容性）
+        run: |
+          set -euo pipefail
+          # 保留原始 cp
+          sudo cp -a /usr/bin/cp /usr/bin/cp.orig
+          # 包装脚本：把 --update=xxx 统一降级为 -n（不覆盖）
+          sudo tee /usr/bin/cp > /dev/null <<'EOF'
+#!/bin/bash
+args=()
+for arg in "$@"; do
+  if [[ "$arg" == "--update" ]]; then
+    args+=("-n")
+  elif [[ "$arg" == --update=* ]]; then
+    args+=("-n")
+  else
+    args+=("$arg")
+  fi
+done
+exec /usr/bin/cp.orig "${args[@]}"
+EOF
+          sudo chmod 755 /usr/bin/cp
+          echo "===== 验证包装 cp ====="
+          which cp
+          cp --version | head -1
+          echo "test" > /tmp/_cp_src
+          cp --update=older /tmp/_cp_src /tmp/_cp_dst && echo "✅ --update=older 可用"
+          rm -f /tmp/_cp_src /tmp/_cp_dst
+
+      # ============================================================
+      # Phase 6: 打包固件
       # ============================================================
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
@@ -483,6 +514,21 @@ jobs:
           name: N1-OpenWrt-AX900M-${{ env.KVER }}
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
+
+      # ============================================================
+      # Phase 7.5: 恢复系统 cp（无论如何都执行）
+      # ============================================================
+      - name: 恢复系统 cp
+        if: always()
+        run: |
+          if [ -f /usr/bin/cp.orig ]; then
+            sudo cp -a /usr/bin/cp.orig /usr/bin/cp
+            sudo rm -f /usr/bin/cp.orig
+            echo "✅ 已恢复系统 cp"
+          else
+            echo "⚠️ cp.orig 不存在，跳过恢复"
+          fi
+          ls -la /usr/bin/cp
 
       - name: 推送结果到钉钉
         if: always()
