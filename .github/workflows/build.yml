@@ -463,6 +463,9 @@ jobs:
       # ============================================================
       # Phase 6: 打包固件
       # ============================================================
+      - name: 创建输出目录
+        run: mkdir -p "${GITHUB_WORKSPACE}/output"
+
       - name: 打包 N1 固件
         uses: ophub/flippy-openwrt-actions@main
         env:
@@ -474,6 +477,15 @@ jobs:
           OPENWRT_IP: 192.168.10.1
           WHOAMI: ophub
           GZIP_IMGS: .gz
+          OUTPUT_PATH: ${{ github.workspace }}/output   # ★ 新增：显式指定输出目录
+
+      - name: 检查打包产物
+        run: |
+          set -euo pipefail
+          echo "===== 输出目录内容: ${GITHUB_WORKSPACE}/output ====="
+          ls -la "${GITHUB_WORKSPACE}/output" || true
+          echo "===== 搜索可能生成的 .img.gz ====="
+          find "${GITHUB_WORKSPACE}" /opt/openwrt_packit -name "*.img.gz" -type f 2>/dev/null || true
 
       # ============================================================
       # Phase 7: 上传产物
@@ -482,7 +494,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: N1-OpenWrt-AX900M-${{ env.KVER }}
-          path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
+          path: ${{ github.workspace }}/output/*.img.gz   # ★ 改用明确的输出目录
           if-no-files-found: error
 
       - name: 推送结果到钉钉
