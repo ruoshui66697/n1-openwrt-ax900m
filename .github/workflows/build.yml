@@ -218,12 +218,20 @@ jobs:
         run: |
           set -euo pipefail
           cd openwrt
-          ROOTFS_PATH=$(find bin/targets/armsr -name "*rootfs.tar.gz" | head -1)
-          if [ -z "$ROOTFS_PATH" ]; then
-            echo "❌ rootfs 不存在"
+
+          # 使用绝对路径查找，并保留 head -1 以防万一
+          ROOTFS_PATH=$(find "$PWD/bin/targets/armsr" -name "*rootfs.tar.gz" | head -1)
+
+          if [ -z "$ROOTFS_PATH" ] || [ ! -f "$ROOTFS_PATH" ]; then
+            echo "❌ rootfs 文件未找到或路径无效"
+            echo "查找路径: $PWD/bin/targets/armsr"
+            find "$PWD/bin/targets/armsr" -type f -name "*rootfs*" || true
             exit 1
           fi
+
           echo "ROOTFS_PATH=${ROOTFS_PATH}" >> $GITHUB_ENV
+          echo "✅ rootfs 路径: ${ROOTFS_PATH}"
+          echo "文件大小: $(du -h "$ROOTFS_PATH" | cut -f1)"
 
       # ============================================================
       # Phase 3.5: 组装注入包
@@ -276,6 +284,13 @@ jobs:
         run: |
           set -euo pipefail
           ROOTFS="${ROOTFS_PATH}"
+
+          if [ ! -f "$ROOTFS" ]; then
+            echo "❌ 注入步骤：ROOTFS 文件不存在: $ROOTFS"
+            echo "当前 ROOTFS_PATH 环境变量: ${ROOTFS_PATH}"
+            exit 1
+          fi
+
           INJECT="$GITHUB_WORKSPACE/inject"
           TMPDIR=$(mktemp -d)
           trap 'rm -rf "$TMPDIR"' EXIT
