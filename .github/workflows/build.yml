@@ -25,6 +25,7 @@ on:
 env:
   AIC_REPO_URL: https://github.com/shenmintao/aic8800d80.git
   KERNEL_RELEASE_TAG: kernel_stable
+  KERNEL_MIRROR: https://github.com/gregkh/linux.git
 
 jobs:
   build:
@@ -65,17 +66,34 @@ jobs:
       # ============================================================
       # Phase 1: 自编译 Amlogic 内核
       # ============================================================
-      - name: 克隆 Linux 内核源码
+      - name: 克隆 Linux 内核源码 (GitHub 镜像 + 重试)
         run: |
           set -euo pipefail
           KVER="${{ github.event.inputs.kernel_version }}"
           echo "KVER=${KVER}" >> $GITHUB_ENV
           KTAG="v${KVER}"
-          echo "克隆 Linux ${KTAG} (depth=1)..."
-          git clone --depth 1 --branch "${KTAG}" \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git /tmp/linux
-          cd /tmp/linux
-          echo "内核源码就绪: $(git describe --tags)"
+
+          clone_kernel() {
+            rm -rf /tmp/linux
+            git clone --depth 1 --branch "${KTAG}" \
+              "${KERNEL_MIRROR}" /tmp/linux
+          }
+
+          MAX_RETRY=3
+          for i in $(seq 1 $MAX_RETRY); do
+            echo "尝试克隆 ${KTAG} (${i}/${MAX_RETRY})..."
+            if clone_kernel; then
+              echo "✅ 内核源码克隆成功"
+              exit 0
+            fi
+            if [ "$i" -eq "$MAX_RETRY" ]; then
+              echo "❌ 克隆失败，已达最大重试次数"
+              exit 1
+            fi
+            echo "克隆失败，清理后 5 秒重试..."
+            rm -rf /tmp/linux
+            sleep 5
+          done
 
       - name: 配置内核
         run: |
@@ -267,9 +285,9 @@ jobs:
           echo "✅ 注入文件已合并到 rootfs"
 
       # ============================================================
-      # Phase 4: 打包内核为 ophub 格式（3 独立子 tar + sha256sums）
+      # Phase 4: 打包内核为 3 个独立子 tar + sha256sums
       # ============================================================
-      - name: 打包内核为 ophub 格式
+      - name: 打包内核子包
         run: |
           set -euo pipefail
           KVER="${{ env.KVER }}"
@@ -279,7 +297,6 @@ jobs:
           rm -rf "$PKG"
           mkdir -p "$PKG/$KNAME"/{boot,dtb}
 
-          # boot/
           cp /tmp/linux/arch/arm64/boot/Image  "$PKG/$KNAME/boot/vmlinuz-${KNAME}"
           cp /tmp/linux/.config                "$PKG/$KNAME/boot/config-${KNAME}"
           cp /tmp/linux/System.map             "$PKG/$KNAME/boot/System.map-${KNAME}"
@@ -287,50 +304,40 @@ jobs:
           mkimage -A arm64 -O linux -T ramdisk -C gzip \
             -d /tmp/initrd.gz "$PKG/$KNAME/boot/uInitrd-${KNAME}"
 
-          # dtb/
           cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxl-*.dtb "$PKG/$KNAME/dtb/" 2>/dev/null || true
           cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxm-*.dtb "$PKG/$KNAME/dtb/" 2>/dev/null || true
           test -f "$PKG/$KNAME/dtb/meson-gxl-s905d-phicomm-n1.dtb" || {
             echo "❌ 缺少 N1 DTB"; exit 1
           }
 
-          # modules: 暂存到 MOD_STAGING，同时提供 lib/modules 与 usr/lib/modules
           MOD_STAGING=/tmp/kernel_mods
           rm -rf "$MOD_STAGING"
           mkdir -p "$MOD_STAGING"
           cd /tmp/linux
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             INSTALL_MOD_PATH="$MOD_STAGING" modules_install 2>&1 | tail -5
-
-          # 移除 build/source 软链
           rm -f "$MOD_STAGING/lib/modules/${KNAME}/build"
           rm -f "$MOD_STAGING/lib/modules/${KNAME}/source"
 
-          # AIC8800 模块
           SKIP="${{ steps.build_aic8800.outputs.skip }}"
           if [ "$SKIP" != "true" ] && [ -d /tmp/aic8800_modules ]; then
             MOD_DIR="$MOD_STAGING/lib/modules/${KNAME}"
             mkdir -p "$MOD_DIR/kernel/drivers/aic8800"
             cp /tmp/aic8800_modules/*.ko "$MOD_DIR/kernel/drivers/aic8800/"
           fi
-
           depmod -b "$MOD_STAGING" "${KNAME}"
 
-          # 硬链接生成 usr/lib/modules 路径（不占额外空间）
           mkdir -p "$MOD_STAGING/usr/lib/modules"
           cp -al "$MOD_STAGING/lib/modules/${KNAME}" \
                  "$MOD_STAGING/usr/lib/modules/${KNAME}"
 
-          # 校验两条路径非空
           for MOD_DIR in \
             "$MOD_STAGING/lib/modules/${KNAME}" \
             "$MOD_STAGING/usr/lib/modules/${KNAME}"; do
             KO_COUNT=$(find "$MOD_DIR" -name "*.ko" | wc -l)
-            echo "${MOD_DIR}: ${KO_COUNT} .ko"
             [ "${KO_COUNT}" -gt 0 ] || { echo "❌ 模块目录为空: ${MOD_DIR}"; exit 1; }
           done
 
-          # 打包 3 个子 tar + sha256sums（与 unifreq/openwrt_packit 约定一致）
           cd "$PKG/$KNAME"
           tar czf "boot-${KNAME}.tar.gz"        --owner=0 --group=0 -C boot .
           tar czf "dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C dtb  .
@@ -339,12 +346,11 @@ jobs:
             "lib/modules/${KNAME}" "usr/lib/modules/${KNAME}"
 
           sha256sum boot-*.tar.gz dtb-amlogic-*.tar.gz modules-*.tar.gz > sha256sums
-
           echo "✅ 内核子包打包完成"
           ls -lh boot-*.tar.gz dtb-amlogic-*.tar.gz modules-*.tar.gz sha256sums
 
       # ============================================================
-      # Phase 5: 上传独立子包到 GitHub Release（关键修正）
+      # Phase 5: 上传独立子包到 Release
       # ============================================================
       - name: 上传内核子包到 Release
         env:
@@ -356,16 +362,12 @@ jobs:
           REPO="${{ github.repository }}"
           SUBDIR="/tmp/kernel_pkg/${KNAME}"
 
-          test -d "${SUBDIR}" || { echo "❌ 内核子包目录不存在"; exit 1; }
-
-          # 清理旧 release
           for OLD_TAG in "kernel_stable" "stable"; do
             if gh release view "${OLD_TAG}" --repo "${REPO}" >/dev/null 2>&1; then
               gh release delete "${OLD_TAG}" --cleanup-tag --yes --repo "${REPO}" || true
             fi
           done
 
-          echo "创建 release ${TAG} 并上传独立子包..."
           gh release create "${TAG}" \
             "${SUBDIR}/boot-${KNAME}.tar.gz" \
             "${SUBDIR}/dtb-amlogic-${KNAME}.tar.gz" \
@@ -378,7 +380,7 @@ jobs:
           echo "✅ 内核子包已上传到 release ${TAG}"
 
       # ============================================================
-      # Phase 6: 使用 flippy-openwrt-actions 打包固件
+      # Phase 6: 打包固件
       # ============================================================
       - name: 打包 N1 固件
         uses: ophub/flippy-openwrt-actions@main
@@ -393,7 +395,7 @@ jobs:
           GZIP_IMGS: .gz
 
       # ============================================================
-      # Phase 7: 上传固件产物
+      # Phase 7: 上传产物
       # ============================================================
       - name: 上传固件到 Artifacts
         uses: actions/upload-artifact@v4
