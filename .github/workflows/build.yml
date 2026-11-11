@@ -352,56 +352,39 @@ jobs:
 
           cd /tmp/kernel_pkg
 
-          # ★ 同时满足两套路径预期：
-          #   usr/lib/modules/${KNAME}  → 真实目录（ophub replace_kernel 的安装目标）
-          #   lib/modules/${KNAME}      → 符号链接（remake 脚本第 975 行硬编码的 cd 目标）
+          # ★ 双实体目录：同时满足 remake (lib/modules) 和 replace_kernel (usr/lib/modules)
           mkdir -p "${KNAME}/s905d/rootfs/usr/lib/modules"
           mv "${KNAME}/modules/lib/modules/${KNAME}" \
              "${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}"
 
           mkdir -p "${KNAME}/s905d/rootfs/lib/modules"
-          ln -s "../../usr/lib/modules/${KNAME}" \
+          cp -a "${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}" \
                 "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
 
           mv "${KNAME}/boot" "${KNAME}/s905d/boot"
           mv "${KNAME}/dtb"  "${KNAME}/s905d/dtb"
           rm -rf "${KNAME}/modules"
 
-          # ---- 验证 1: usr/lib/modules 真实目录存在且非空 ----
-          USR_MOD_DIR="${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}"
-          if [ ! -d "${USR_MOD_DIR}" ]; then
-            echo "❌ 真实模块目录不存在: ${USR_MOD_DIR}"
-            exit 1
-          fi
-          KO_COUNT=$(find "${USR_MOD_DIR}" -name "*.ko" | wc -l)
-          echo "usr/lib/modules 下 .ko 文件数: ${KO_COUNT}"
-          if [ "${KO_COUNT}" -eq 0 ]; then
-            echo "❌ 真实模块目录为空"
-            exit 1
-          fi
+          # ---- 验证两个实体目录都存在且非空 ----
+          for MOD_DIR in \
+            "${KNAME}/s905d/rootfs/usr/lib/modules/${KNAME}" \
+            "${KNAME}/s905d/rootfs/lib/modules/${KNAME}"; do
+            if [ ! -d "${MOD_DIR}" ]; then
+              echo "❌ 模块目录不存在: ${MOD_DIR}"
+              exit 1
+            fi
+            KO_COUNT=$(find "${MOD_DIR}" -name "*.ko" | wc -l)
+            echo "${MOD_DIR} 下 .ko 文件数: ${KO_COUNT}"
+            if [ "${KO_COUNT}" -eq 0 ]; then
+              echo "❌ 模块目录为空: ${MOD_DIR}"
+              exit 1
+            fi
+          done
 
-          # ---- 验证 2: lib/modules 符号链接可解析，且 cd 能进入 ----
-          LIB_LINK="${KNAME}/s905d/rootfs/lib/modules/${KNAME}"
-          if [ ! -L "${LIB_LINK}" ]; then
-            echo "❌ lib/modules 符号链接不存在: ${LIB_LINK}"
-            exit 1
-          fi
-          if ! ( cd "${LIB_LINK}" 2>/dev/null ); then
-            echo "❌ 无法通过 lib/modules 符号链接进入目录"
-            ls -la "${KNAME}/s905d/rootfs/lib/modules/" 2>/dev/null || true
-            exit 1
-          fi
-          echo "✅ lib/modules 符号链接可正常解析"
-          echo "   链接指向: $(readlink "${LIB_LINK}")"
-          echo "   真实目录: $(readlink -f "${LIB_LINK}")"
-
-          # 展示结构
           echo "===== s905d 目录结构 ====="
           find "${KNAME}/s905d" -maxdepth 5 -type d 2>/dev/null | head -30 || true
-          echo "===== lib/modules 下的链接 ====="
-          ls -la "${KNAME}/s905d/rootfs/lib/modules/" 2>/dev/null || true
 
-          # 创建 tarball
+          # 创建 tarball（包含两个路径）
           tar czf "${KNAME}/boot-${KNAME}.tar.gz"        --owner=0 --group=0 -C "${KNAME}/s905d/boot" .
           tar czf "${KNAME}/dtb-amlogic-${KNAME}.tar.gz" --owner=0 --group=0 -C "${KNAME}/s905d/dtb" .
           tar czf "${KNAME}/modules-${KNAME}.tar.gz"     --owner=0 --group=0 -C "${KNAME}/s905d/rootfs" \
@@ -413,7 +396,7 @@ jobs:
 
           tar czf "/tmp/${KNAME}.tar.gz" --owner=0 --group=0 "${KNAME}"
 
-          # ★ tar 包内路径验证（两套路径都必须存在）
+          # ★ tar 包内路径验证（两个路径都必须存在）
           echo "===== tar 包内部结构验证 ====="
           tar -tzf "/tmp/${KNAME}.tar.gz" > /tmp/kernel_tarlist.txt 2>/dev/null
 
@@ -421,12 +404,11 @@ jobs:
             echo "❌ tar 包缺少 usr/lib/modules/${KNAME}/ 路径"
             exit 1
           fi
-          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}$" /tmp/kernel_tarlist.txt; then
-            echo "❌ tar 包缺少 lib/modules/${KNAME} 符号链接条目"
-            grep 'lib/modules' /tmp/kernel_tarlist.txt | head -10 || true
+          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" /tmp/kernel_tarlist.txt; then
+            echo "❌ tar 包缺少 lib/modules/${KNAME}/ 路径"
             exit 1
           fi
-          echo "✅ tar 包同时包含 usr/lib/modules 真实目录与 lib/modules 符号链接"
+          echo "✅ tar 包同时包含 usr/lib/modules 和 lib/modules 的真实目录"
 
           echo "内核包打包完成:"
           ls -lh /tmp/${KNAME}.tar.gz
@@ -513,11 +495,11 @@ jobs:
             echo "❌ Release 资产缺少 usr/lib/modules 真实目录"
             exit 1
           fi
-          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}$" /tmp/release_tarlist.txt; then
-            echo "❌ Release 资产缺少 lib/modules 符号链接"
+          if ! grep -q "^${KNAME}/s905d/rootfs/lib/modules/${KNAME}/" /tmp/release_tarlist.txt; then
+            echo "❌ Release 资产缺少 lib/modules 真实目录"
             exit 1
           fi
-          echo "✅ Release 资产同时包含 usr/lib/modules 与 lib/modules 链接"
+          echo "✅ Release 资产同时包含 usr/lib/modules 和 lib/modules 真实目录"
 
       - name: 打包 N1 固件
         uses: ophub/amlogic-s9xxx-openwrt@main
