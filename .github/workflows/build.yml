@@ -460,64 +460,19 @@ jobs:
           grep -q "^sha256sums$"                  /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 sha256sums"; exit 1; }
           echo "✅ Release 资产与整体包结构验证通过"
 
-       # ============================================================
-      # Phase 6: 打包固件
+      # ============================================================
+      # Phase 6: 打包固件（换回 amlogic-s9xxx-openwrt）
       # ============================================================
       - name: 打包 N1 固件
-        uses: ophub/flippy-openwrt-actions@main
-        env:
-          OPENWRT_ARMSR: ${{ env.ROOTFS_PATH }}
-          PACKAGE_SOC: s905d
-          KERNEL_REPO_URL: ${{ github.repository }}
-          KERNEL_VERSION_NAME: ${{ env.KNAME }}
-          KERNEL_AUTO_LATEST: false
-          OPENWRT_IP: 192.168.10.1
-          WHOAMI: ophub
-          GZIP_IMGS: .gz
-          # OUTPUT_PATH 已移除：使用 action 默认输出位置（/opt/openwrt_packit/output）
-
-      - name: 收集并验证固件产物
-        run: |
-          set -euo pipefail
-          OUT="${GITHUB_WORKSPACE}/output"
-          mkdir -p "$OUT"
-
-          echo "===== 搜索候选 .img.gz 文件 ====="
-          # 覆盖 action 默认输出、workspace、openwrt_packit 克隆目录
-          SEARCH_DIRS=(
-            "/opt/openwrt_packit/output"
-            "/opt/openwrt_packit"
-            "${GITHUB_WORKSPACE}"
-            "${GITHUB_WORKSPACE}/openwrt_packit"
-          )
-          FOUND=0
-          for d in "${SEARCH_DIRS[@]}"; do
-            if [ -d "$d" ]; then
-              while IFS= read -r f; do
-                [ -z "$f" ] && continue
-                echo "找到: $f"
-                cp -v "$f" "$OUT/" || true
-                FOUND=1
-              done < <(find "$d" -maxdepth 3 -name "*.img.gz" -type f 2>/dev/null)
-            fi
-          done
-
-          echo "===== 输出目录内容: $OUT ====="
-          ls -la "$OUT" || true
-
-          if [ "$FOUND" -eq 0 ] || [ -z "$(ls -A "$OUT" 2>/dev/null)" ]; then
-            echo "❌ 未找到任何 .img.gz 文件"
-            echo "----- /opt/openwrt_packit 目录结构 -----"
-            ls -laR /opt/openwrt_packit 2>/dev/null | head -80 || true
-            echo "----- ${GITHUB_WORKSPACE} 目录结构 (一级) -----"
-            ls -la "${GITHUB_WORKSPACE}" 2>/dev/null || true
-            echo "----- 全盘搜索 .img* (限深度 4) -----"
-            find / -maxdepth 4 -name "*.img*" -type f 2>/dev/null | grep -v -E '^/(proc|sys)' | head -30 || true
-            exit 1
-          fi
-
-          echo "✅ 已收集固件产物:"
-          ls -lh "$OUT"/*.img.gz
+        uses: ophub/amlogic-s9xxx-openwrt@main
+        with:
+          openwrt_path: ${{ env.ROOTFS_PATH }}
+          openwrt_board: s905d
+          kernel_repo: ${{ github.repository }}
+          kernel_usage: stable
+          openwrt_kernel: ${{ env.KNAME }}
+          auto_kernel: false
+          openwrt_files: inject
 
       # ============================================================
       # Phase 7: 上传产物
@@ -526,7 +481,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: N1-OpenWrt-AX900M-${{ env.KVER }}
-          path: ${{ github.workspace }}/output/*.img.gz
+          path: ${{ env.PACKAGED_OUTPUTPATH }}/*.img.gz
           if-no-files-found: error
 
       - name: 推送结果到钉钉
