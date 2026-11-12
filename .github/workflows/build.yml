@@ -378,7 +378,9 @@ jobs:
 
           echo "✅ 内核树打包完成: /tmp/${KNAME}.tar.gz"
           echo "===== tar 内部目录结构验证 ====="
-          tar -tzf "/tmp/${KNAME}.tar.gz" | grep -E "(boot/|dtb/|lib/modules/)" | head -n 10
+          # 避免管道 SIGPIPE 误杀
+          tar -tzf "/tmp/${KNAME}.tar.gz" > /tmp/kernel_tree_list.txt
+          grep -E "(boot/|dtb/|lib/modules/)" /tmp/kernel_tree_list.txt | head -n 10 || true
 
       # ============================================================
       # Phase 5: 上传内核目录树到 Release
