@@ -219,7 +219,6 @@ jobs:
           set -euo pipefail
           cd openwrt
 
-          # 使用绝对路径查找，并保留 head -1 以防万一
           ROOTFS_PATH=$(find "$PWD/bin/targets/armsr" -name "*rootfs.tar.gz" | head -1)
 
           if [ -z "$ROOTFS_PATH" ] || [ ! -f "$ROOTFS_PATH" ]; then
@@ -287,7 +286,6 @@ jobs:
 
           if [ ! -f "$ROOTFS" ]; then
             echo "❌ 注入步骤：ROOTFS 文件不存在: $ROOTFS"
-            echo "当前 ROOTFS_PATH 环境变量: ${ROOTFS_PATH}"
             exit 1
           fi
 
@@ -300,9 +298,9 @@ jobs:
           echo "✅ 注入文件已合并到 rootfs"
 
       # ============================================================
-      # Phase 4: 打包内核子包 + 整体包
+      # Phase 4: 打包内核为 ophub 目录树格式 (兼容 remake)
       # ============================================================
-      - name: 打包内核子包 + 整体包
+      - name: 打包内核为 ophub 格式
         run: |
           set -euo pipefail
           KVER="${{ env.KVER }}"
@@ -310,93 +308,82 @@ jobs:
           echo "KNAME=${KNAME}" >> $GITHUB_ENV
 
           PKG=/tmp/kernel_pkg
-          SUBDIR="$PKG/$KNAME"
           rm -rf "$PKG"
-          mkdir -p "$SUBDIR"/{boot,dtb}
+          
+          # 按照 remake 脚本期望的路径建目录
+          mkdir -p "$PKG/$KNAME/s905d/boot"
+          mkdir -p "$PKG/$KNAME/s905d/dtb"
+          mkdir -p "$PKG/$KNAME/s905d/rootfs/lib/modules"
+          mkdir -p "$PKG/$KNAME/s905d/rootfs/usr/lib/modules"
 
-          # ---- boot/ ----
-          cp /tmp/linux/arch/arm64/boot/Image  "$SUBDIR/boot/vmlinuz-${KNAME}"
-          cp /tmp/linux/.config                "$SUBDIR/boot/config-${KNAME}"
-          cp /tmp/linux/System.map             "$SUBDIR/boot/System.map-${KNAME}"
+          # 1. 放入 boot 文件
+          cp /tmp/linux/arch/arm64/boot/Image  "$PKG/$KNAME/s905d/boot/vmlinuz-${KNAME}"
+          cp /tmp/linux/.config                "$PKG/$KNAME/s905d/boot/config-${KNAME}"
+          cp /tmp/linux/System.map             "$PKG/$KNAME/s905d/boot/System.map-${KNAME}"
+          
           echo | cpio -o -H newc 2>/dev/null | gzip -9 > /tmp/initrd.gz
           mkimage -A arm64 -O linux -T ramdisk -C gzip \
-            -d /tmp/initrd.gz "$SUBDIR/boot/uInitrd-${KNAME}"
+            -d /tmp/initrd.gz "$PKG/$KNAME/s905d/boot/uInitrd-${KNAME}"
 
-          # ---- dtb/ ----
-          cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxl-*.dtb "$SUBDIR/dtb/" 2>/dev/null || true
-          cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxm-*.dtb "$SUBDIR/dtb/" 2>/dev/null || true
-          test -f "$SUBDIR/dtb/meson-gxl-s905d-phicomm-n1.dtb" || {
+          # 2. 放入 DTB 文件
+          cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxl-*.dtb "$PKG/$KNAME/s905d/dtb/" 2>/dev/null || true
+          cp /tmp/linux/arch/arm64/boot/dts/amlogic/meson-gxm-*.dtb "$PKG/$KNAME/s905d/dtb/" 2>/dev/null || true
+          
+          test -f "$PKG/$KNAME/s905d/dtb/meson-gxl-s905d-phicomm-n1.dtb" || {
             echo "❌ 缺少 N1 DTB"; exit 1
           }
 
-          # ---- modules/ ----
+          # 3. 安装模块到暂存区
           MOD_STAGING=/tmp/kernel_mods
           rm -rf "$MOD_STAGING"
           mkdir -p "$MOD_STAGING"
           cd /tmp/linux
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             INSTALL_MOD_PATH="$MOD_STAGING" modules_install 2>&1 | tail -5
+
+          # 删除干扰项
           rm -f "$MOD_STAGING/lib/modules/${KNAME}/build"
           rm -f "$MOD_STAGING/lib/modules/${KNAME}/source"
 
+          # 加入 AIC8800
           SKIP="${{ steps.build_aic8800.outputs.skip }}"
           if [ "$SKIP" != "true" ] && [ -d /tmp/aic8800_modules ]; then
             MOD_DIR="$MOD_STAGING/lib/modules/${KNAME}"
             mkdir -p "$MOD_DIR/kernel/drivers/aic8800"
             cp /tmp/aic8800_modules/*.ko "$MOD_DIR/kernel/drivers/aic8800/"
           fi
+
           depmod -b "$MOD_STAGING" "${KNAME}"
 
-          # 双路径：usr/lib/modules 用硬链接（省空间）
-          mkdir -p "$MOD_STAGING/usr/lib/modules"
-          cp -al "$MOD_STAGING/lib/modules/${KNAME}" \
-                 "$MOD_STAGING/usr/lib/modules/${KNAME}"
+          # 4. 移入目标目录，并生成双路径
+          mv "$MOD_STAGING/lib/modules/${KNAME}" \
+             "$PKG/$KNAME/s905d/rootfs/lib/modules/"
+          
+          # 用 cp -al 创建硬链接，避免占用双倍空间
+          cp -al "$PKG/$KNAME/s905d/rootfs/lib/modules/${KNAME}" \
+                 "$PKG/$KNAME/s905d/rootfs/usr/lib/modules/"
 
+          # 5. 校验模块非空
           for MOD_DIR in \
-            "$MOD_STAGING/lib/modules/${KNAME}" \
-            "$MOD_STAGING/usr/lib/modules/${KNAME}"; do
+            "$PKG/$KNAME/s905d/rootfs/lib/modules/${KNAME}" \
+            "$PKG/$KNAME/s905d/rootfs/usr/lib/modules/${KNAME}"; do
             KO_COUNT=$(find "$MOD_DIR" -name "*.ko" | wc -l)
+            echo "${MOD_DIR}: ${KO_COUNT} .ko"
             [ "${KO_COUNT}" -gt 0 ] || { echo "❌ 模块目录为空: ${MOD_DIR}"; exit 1; }
           done
 
-          # ---- 打包 3 个子 tar（明确文件名 + 绝对路径）----
-          BOOT_TGZ="$SUBDIR/boot-${KNAME}.tar.gz"
-          DTB_TGZ="$SUBDIR/dtb-amlogic-${KNAME}.tar.gz"
-          MOD_TGZ="$SUBDIR/modules-${KNAME}.tar.gz"
+          # 6. 直接打包成目录树 (不要包含任何子 tar)
+          cd "$PKG"
+          tar czf "/tmp/${KNAME}.tar.gz" --owner=0 --group=0 "${KNAME}"
 
-          tar czf "$BOOT_TGZ" --owner=0 --group=0 -C "$SUBDIR/boot" .
-          tar czf "$DTB_TGZ"  --owner=0 --group=0 -C "$SUBDIR/dtb"  .
-          tar czf "$MOD_TGZ"  --owner=0 --group=0 \
-            -C "$MOD_STAGING" \
-            "lib/modules/${KNAME}" "usr/lib/modules/${KNAME}"
-
-          # ---- sha256sums（明确文件名，不用通配符）----
-          (
-            cd "$SUBDIR"
-            sha256sum \
-              "boot-${KNAME}.tar.gz" \
-              "dtb-amlogic-${KNAME}.tar.gz" \
-              "modules-${KNAME}.tar.gz" > sha256sums
-          )
-
-          echo "✅ 内核子包打包完成"
-          ls -lh "$BOOT_TGZ" "$DTB_TGZ" "$MOD_TGZ" "$SUBDIR/sha256sums"
-
-          # ---- 整体包（flippy-openwrt-actions 按固定文件名下载此文件）----
-          OVERALL="/tmp/${KNAME}.tar.gz"
-          tar czf "$OVERALL" --owner=0 --group=0 -C "$SUBDIR" \
-            "boot-${KNAME}.tar.gz" \
-            "dtb-amlogic-${KNAME}.tar.gz" \
-            "modules-${KNAME}.tar.gz" \
-            "sha256sums"
-
-          echo "✅ 整体内核包: $OVERALL"
-          ls -lh "$OVERALL"
+          echo "✅ 内核树打包完成: /tmp/${KNAME}.tar.gz"
+          echo "===== tar 内部目录结构验证 ====="
+          tar -tzf "/tmp/${KNAME}.tar.gz" | grep -E "(boot/|dtb/|lib/modules/)" | head -n 10
 
       # ============================================================
-      # Phase 5: 上传子包 + 整体包到 Release
+      # Phase 5: 上传内核目录树到 Release
       # ============================================================
-      - name: 上传内核包到 Release
+      - name: 上传内核到 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -404,61 +391,34 @@ jobs:
           KNAME="${{ env.KNAME }}"
           TAG="${{ env.KERNEL_RELEASE_TAG }}"
           REPO="${{ github.repository }}"
-          SUBDIR="/tmp/kernel_pkg/${KNAME}"
-          OVERALL="/tmp/${KNAME}.tar.gz"
+          ASSET="/tmp/${KNAME}.tar.gz"
 
-          # 上传前文件存在性断言（提前暴露问题）
-          for f in \
-            "$OVERALL" \
-            "$SUBDIR/boot-${KNAME}.tar.gz" \
-            "$SUBDIR/dtb-amlogic-${KNAME}.tar.gz" \
-            "$SUBDIR/modules-${KNAME}.tar.gz" \
-            "$SUBDIR/sha256sums"; do
-            if [ ! -f "$f" ]; then
-              echo "❌ 缺少上传文件: $f"
-              ls -la "$SUBDIR" || true
-              ls -la /tmp/${KNAME}.tar.gz || true
-              exit 1
-            fi
-          done
-          echo "✅ 所有待上传文件存在"
+          test -f "${ASSET}" || { echo "❌ 内核文件不存在: ${ASSET}"; exit 1; }
 
-          # 清理旧 release（避免残留坏包）
           for OLD_TAG in "kernel_stable" "stable"; do
             if gh release view "${OLD_TAG}" --repo "${REPO}" >/dev/null 2>&1; then
               gh release delete "${OLD_TAG}" --cleanup-tag --yes --repo "${REPO}" || true
             fi
           done
 
-          # 上传：整体包 + 3 个子包 + sha256sums
-          gh release create "${TAG}" \
-            "$OVERALL" \
-            "$SUBDIR/boot-${KNAME}.tar.gz" \
-            "$SUBDIR/dtb-amlogic-${KNAME}.tar.gz" \
-            "$SUBDIR/modules-${KNAME}.tar.gz" \
-            "$SUBDIR/sha256sums" \
+          gh release create "${TAG}" "${ASSET}" \
             --repo "${REPO}" \
             --title "Kernel ${KNAME}" \
             --notes "Self-compiled kernel ${KNAME} for Amlogic S905D (N1)"
 
-          # 上传后校验资产
-          echo "===== 验证 release 资产 ====="
-          gh release view "${TAG}" --repo "${REPO}" --json assets --jq ".assets[].name"
+          echo "✅ 内核已上传到 release ${TAG}"
 
-          echo "等待 GitHub 传播 (10 秒)..."
+          # 下载回来二次验证
           sleep 10
-
-          # 下载整体包并校验能被 unifreq/openwrt_packit 正确解包
           rm -rf /tmp/verify && mkdir -p /tmp/verify
           gh release download "${TAG}" --repo "${REPO}" \
             --pattern "${KNAME}.tar.gz" --dir /tmp/verify --clobber
 
-          tar -tzf "/tmp/verify/${KNAME}.tar.gz" > /tmp/overall_tarlist.txt 2>/dev/null
-          grep -q "^boot-${KNAME}.tar.gz$"        /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 boot";   exit 1; }
-          grep -q "^dtb-amlogic-${KNAME}.tar.gz$" /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 dtb";    exit 1; }
-          grep -q "^modules-${KNAME}.tar.gz$"     /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 modules"; exit 1; }
-          grep -q "^sha256sums$"                  /tmp/overall_tarlist.txt || { echo "❌ 整体包缺 sha256sums"; exit 1; }
-          echo "✅ Release 资产与整体包结构验证通过"
+          tar -tzf "/tmp/verify/${KNAME}.tar.gz" > /tmp/release_tarlist.txt 2>/dev/null
+          grep -q "^${KNAME}/s905d/boot/vmlinuz-" /tmp/release_tarlist.txt || { echo "❌ 验证失败: 缺少 boot"; exit 1; }
+          grep -q "^${KNAME}/s905d/rootfs/lib/modules/" /tmp/release_tarlist.txt || { echo "❌ 验证失败: 缺少 lib/modules"; exit 1; }
+          grep -q "^${KNAME}/s905d/rootfs/usr/lib/modules/" /tmp/release_tarlist.txt || { echo "❌ 验证失败: 缺少 usr/lib/modules"; exit 1; }
+          echo "✅ Release 资产验证通过"
 
       # ============================================================
       # Phase 5.5: 临时包装 cp
